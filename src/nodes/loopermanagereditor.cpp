@@ -271,10 +271,10 @@ struct LooperManagerEditor::Impl final : Component, Timer, DragAndDropContainer 
         std::vector<std::unique_ptr<MappingRow>> mappings;
         SettingsPanel(Impl& u):ui(u){
             for(Component* c:std::initializer_list<Component*>{&managerNameLabel,&managerNameCount,&managerName,&orderTitle,&navTitle,&orderLabel,&shortLabel,&longLabel,&profileLabel,&shortBarsLabel,&longBarsLabel,&help,&order,&shortTiming,&longTiming,&navProfile,&longProfile,&longProfileLabel,&shortSwitch,&longSwitch,&first,&last,&up,&down,&reset,&shortBars,&longBars})addAndMakeVisible(c);
-            managerName.setTooltip("Name this Manager in the rig. New names are limited to 12 characters. Enter or leaving the field applies the name; an empty name is ignored.");managerNameLabel.setTooltip(managerName.getTooltip());
+            managerName.setTooltip("Name this Manager in the rig. Custom names are limited to 12 characters; the default QLooper Manager name is exempt. Enter or leaving the field applies the name; an empty name is ignored.");managerNameLabel.setTooltip(managerName.getTooltip());
             managerName.setComponentID("manager-name");managerLabel(managerNameLabel,"Name");
             const auto rename=[this]{auto value=managerName.getText().trim();if(value.isNotEmpty())ui.owner.getNode().setProperty(tags::name,value);};
-            managerName.onTextChange=[this]{if(managerName.getText().length()>12)managerName.setText(managerName.getText().substring(0,12),false);managerNameCount.setText(String(managerName.getText().length())+"/12",dontSendNotification);};
+            managerName.onTextChange=[this]{if(managerName.getText()!="QLooper Manager" && managerName.getText().length()>12)managerName.setText(managerName.getText().substring(0,12),false);managerNameCount.setText(managerName.getText()=="QLooper Manager"?String("Default"):String(managerName.getText().length())+"/12",dontSendNotification);};
             managerName.onReturnKey=rename;managerName.onFocusLost=rename;
             managerLabel(orderTitle,"LOOPER ORDER");managerLabel(navTitle,"MIDI LOOPER SWITCHING");managerLabel(orderLabel,"Looper");
             managerLabel(shortLabel,"Short press");managerLabel(longLabel,"Long press");managerLabel(profileLabel,"Recording action");managerLabel(longProfileLabel,"Recording action");
@@ -318,7 +318,7 @@ struct LooperManagerEditor::Impl final : Component, Timer, DragAndDropContainer 
                 "Start all managed loops on press. After Stop All, restart together from the beginning; with all stopped, a running rig clock and any Sync loop, wait for the next bar. If some already play, join the shared timeline. Capture blocks Play All. Send 127 on press and 0 on release.",
                 "Channel for the four shared Manager MIDI mappings. Zero accepts any channel; 1-16 selects one. Assign learns the channel too. Per-looper box mappings below have their own channels. Conflicting assignments are rejected."};
             for(int i=0;i<5;++i){values[i].setTooltip(globalHelp[i]+(i<4?String(" CC -1 disables the assignment."):String()));labels[i].setTooltip(values[i].getTooltip());if(i<4)assigns[i].setTooltip("Learn this Manager action from the next CC press. Assign saves the CC and shared channel. Click again to cancel. Use unique mappings; conflicts are rejected.");}
-            managerLabel(help,"These mappings control loopers in this Looper Manager, independently of their pedal mappings.");
+            managerLabel(help,"These mappings control loopers in this QLooper Manager, independently of their pedal mappings.");
         }
         std::atomic<int>& navValue(int i){return i==0?ui.manager.previousCC:i==1?ui.manager.nextCC:i==2?ui.manager.stopAllCC:i==3?ui.manager.playAllCC:ui.manager.channel;}
         void rebuild(){
@@ -332,7 +332,7 @@ struct LooperManagerEditor::Impl final : Component, Timer, DragAndDropContainer 
             order.updateContent();auto found=std::find(orderIds.begin(),orderIds.end(),old);order.selectRow(found==orderIds.end()?0:int(found-orderIds.begin()));
         }
         void refresh(){
-            if(!managerName.hasKeyboardFocus(true))managerName.setText(ui.owner.getNode().getName(),false);managerNameCount.setText(String(managerName.getText().length())+"/12",dontSendNotification);
+            if(!managerName.hasKeyboardFocus(true))managerName.setText(ui.owner.getNode().getName(),false);managerNameCount.setText(managerName.getText()=="QLooper Manager"?String("Default"):String(managerName.getText().length())+"/12",dontSendNotification);
             const bool locked=ui.manager.isLocked();for(Component* c:std::initializer_list<Component*>{&order,&first,&last,&up,&down,&longProfile,&shortTiming,&longTiming,&shortBars,&longBars,&navProfile})c->setEnabled(!locked);
             shortTiming.setSelectedId(ui.manager.shortTiming.load()+1,dontSendNotification);longTiming.setSelectedId(ui.manager.longTiming.load()+1,dontSendNotification);
             navProfile.setSelectedId(ui.manager.navigationProfile.load()+2,dontSendNotification);
@@ -341,7 +341,7 @@ struct LooperManagerEditor::Impl final : Component, Timer, DragAndDropContainer 
             shortBars.setEnabled(!locked&&shortTiming.getSelectedId()==3);longBars.setEnabled(!locked&&longTiming.getSelectedId()==3);
             for(int i=0;i<5;++i){values[i].setValue(navValue(i).load(),dontSendNotification);if(i<4)assigns[i].setButtonText(ui.manager.learn.load()==i+1?"Cancel":"Assign");}
             for(auto& row:mappings)row->refresh();
-            help.setText(ui.manager.lastLearnRejected.load()?"MIDI assignment rejected: this CC/channel is already used.":globalConflict.isNotEmpty()?globalConflict:"These mappings control loopers in this Looper Manager, independently of their pedal mappings.",dontSendNotification);
+            help.setText(ui.manager.lastLearnRejected.load()?"MIDI assignment rejected: this CC/channel is already used.":globalConflict.isNotEmpty()?globalConflict:"These mappings control loopers in this QLooper Manager, independently of their pedal mappings.",dontSendNotification);
         }
         int contentHeight()const{return ui.settingsTab==0?564:280+int(memberTitles.size())*205;}
         void resized()override{
@@ -373,7 +373,7 @@ struct LooperManagerEditor::Impl final : Component, Timer, DragAndDropContainer 
         groupVolume.setRange(0,1,.001);groupPan.setRange(-1,1,.01);groupVolume.setDoubleClickReturnValue(true,1);groupPan.setDoubleClickReturnValue(true,0);
         groupVolume.onValueChange=[this]{manager.groupVolume=float(groupVolume.getValue());};groupPan.onValueChange=[this]{manager.groupPan=float(groupPan.getValue());};
         groupVolume.setTooltip("Group playback volume. Live monitoring and individual looper settings are unchanged.");groupPan.setTooltip("Group playback pan. Live monitoring is unchanged.");
-        managerLabel(title,"Looper Manager");title.setFont(FontOptions(15.0f,Font::bold));display.large=true;display.setComponentID("manager-status-display");display.setColour(Label::backgroundColourId,Colour(0xff111820));display.setColour(Label::outlineColourId,Colour(0xff465564));
+        managerLabel(title,"QLooper Manager");title.setFont(FontOptions(15.0f,Font::bold));display.large=true;display.setComponentID("manager-status-display");display.setColour(Label::backgroundColourId,Colour(0xff111820));display.setColour(Label::outlineColourId,Colour(0xff465564));
         cycle.setComponentID("manager-cycle");cycle.setPercentageDisplay(false);controlledName.setJustificationType(Justification::centred);controlledName.setFont(FontOptions(12));
         pedalGroup.setTextLabelPosition(Justification::centred);pedalGroup.setInterceptsMouseClicks(false,false);
         controlledName.setTooltip("Target of shared pedal/MIDI controls. Direct box MIDI assignments remain independent.");
@@ -397,7 +397,7 @@ struct LooperManagerEditor::Impl final : Component, Timer, DragAndDropContainer 
     ~Impl()override{groupVolume.setLookAndFeel(nullptr);groupPan.setLookAndFeel(nullptr);stopTimer();viewport.setViewedComponent(nullptr,false);setLookAndFeel(nullptr);}
     void timerCallback()override{refresh();}
     void refresh(){
-        title.setText(owner.getNode().getName().isNotEmpty()?owner.getNode().getName():String("Looper Manager"),dontSendNotification);
+        title.setText(owner.getNode().getName().isNotEmpty()?owner.getNode().getName():String("QLooper Manager"),dontSendNotification);
         String sig;for(const auto& t:manager.members())sig+=String(t.node->nodeId)+":"+owner.getNode().getParentGraph().getNodeById(t.node->nodeId).getName()+":"+String(manager.syncMode(t.node->nodeId))+";";sig+="m"+String(manager.masterID());
         if(sig!=signature){signature=sig;cards.clear();for(const auto& t:manager.members()){auto c=std::make_unique<Card>(*this,t.node->nodeId);if(t.node->nodeId==manager.masterID())addAndMakeVisible(*c);else canvas.addAndMakeVisible(*c);cards.push_back(std::move(c));}settingsPanel.rebuild();resized();}
         int n=0;Card* active=nullptr;Card* master=nullptr;

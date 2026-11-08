@@ -2,8 +2,8 @@
 
 **Looping comes first.** Layers become loops. Loops become music.
 
-QLooper — a live layered looper, Looper Manager, Song Manager and combined
-Looper View, built into a modified [Kushview Element](https://github.com/kushview/element).
+QLooper — a live layered looper, QLooper Manager, Song Manager and combined
+QLooper View, built into a modified [Kushview Element](https://github.com/kushview/element).
 An independent release by **princ.biz**, not an official Kushview product.
 
 - Website: https://qlooper.princ.biz
@@ -15,10 +15,10 @@ An independent release by **princ.biz**, not an official Kushview product.
 
 ## What is included
 
-Native Looper with separate editable layers and One Takes, Record/Overdub/custom
+Native QLooper with separate editable layers and One Takes, Record/Overdub/custom
 recording profiles, Free/Sync/Fixed bars, retrospective capture, audio-file import,
-Undo/Redo, feedback, fades and MIDI control. Looper Manager coordinates several
-loopers; Song Manager switches prepared sections. Window → Looper View brings
+Undo/Redo, feedback, fades and MIDI control. QLooper Manager coordinates several
+loopers; Song Manager switches prepared sections. Window → QLooper View brings
 these editors together. Recorder and Sample Pad are also included.
 
 External effects, x42 tuner and TICK metronome are **not bundled**. Looping works

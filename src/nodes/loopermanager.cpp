@@ -9,7 +9,7 @@
 
 namespace element {
 using namespace juce;
-LooperManagerNode::LooperManagerNode() : Processor (0) { setName ("Looper Manager"); }
+LooperManagerNode::LooperManagerNode() : Processor (0) { setName ("QLooper Manager"); }
 void LooperManagerNode::refreshPorts()
 {
     if (getNumPorts()) return;
@@ -45,7 +45,7 @@ void LooperManagerNode::prepareToRender (double rate, int)
 }
 void LooperManagerNode::getPluginDescription (PluginDescription& d) const
 {
-    d.name = d.descriptiveName = "Looper Manager";
+    d.name = d.descriptiveName = "QLooper Manager";
     d.fileOrIdentifier = EL_NODE_ID_LOOPER_MANAGER;
     d.uniqueId = 0x4c4d4731;
     d.pluginFormatName = "Element";

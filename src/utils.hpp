@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once
+#include "appinfo.hpp"
 
 #include <element/juce/core.hpp>
 #include <element/juce/audio_basics.hpp>
@@ -117,7 +118,7 @@ inline static String appName (const String& beforeText = String(),
     if (beforeText.isNotEmpty())
         name << beforeText;
 
-    name << "Element";
+    name << EL_APP_NAME;
 
     if (afterText.isNotEmpty())
         name << afterText;

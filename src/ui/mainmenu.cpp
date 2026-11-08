@@ -275,7 +275,7 @@ void MainMenu::buildViewMenu (PopupMenu& menu)
 
 void MainMenu::buildWindowMenu (PopupMenu& menu)
 {
-    menu.addCommandItem (&cmd, Commands::showLooperView, "Looper View");
+    menu.addCommandItem (&cmd, Commands::showLooperView, "QLooper View");
     menu.addSeparator();
     menu.addCommandItem (&cmd, Commands::hideAllPluginWindows, "Close plugin windows...");
     menu.addCommandItem (&cmd, Commands::showAllPluginWindows, "Show plugin windows...");

@@ -19,17 +19,17 @@ installation. Some menus and internal nodes still use the Element name.
 4. Start at **44.1 or 48 kHz**, **128 or 256 samples**. Use headphones for microphone
    tests to avoid acoustic feedback. Start with output volume low.
 
-## 2. Add and connect a Looper
+## 2. Add and connect a QLooper
 
-1. Create a new session/graph. Show the **Plugins** panel, find **Looper** among
+1. Create a new session/graph. Show the **Plugins** panel, find **QLooper** among
    the built-in Element nodes and drag it into the graph. The Plugins panel is
    in the left sidebar; View → Plugin Manager also lists the available modules.
-   The expected names are Looper, Looper Manager and Song Manager. No plugin scan is
+   The expected names are QLooper, QLooper Manager and Song Manager. No plugin scan is
    required for our built-in nodes.
-2. Connect **Audio In → Looper → Audio Out**. For a mono instrument, connect its
-   input channel to both Looper input channels to hear it in both ears. Connect
-   Looper left/right outputs to the output pair feeding your headphones/speakers.
-3. Double-click the Looper to open its full editor. **Monitor** enables hearing
+2. Connect **Audio In → QLooper → Audio Out**. For a mono instrument, connect its
+   input channel to both QLooper input channels to hear it in both ears. Connect
+   QLooper left/right outputs to the output pair feeding your headphones/speakers.
+3. Double-click the QLooper to open its full editor. **Monitor** enables hearing
    the live input; **Mute** silences recorded loops; **Bypass** passes input through.
 4. For a first test select **Settings → General → Mode → Free**. In
    **Settings → Recording**, set the Overdub start timing to **Now** for this
@@ -55,10 +55,10 @@ The labels in the current editor show the shortcuts. MIDI is optional.
   Configure start/count-in separately for Record, Overdub and the custom profiles.
 - Hover a control for a short explanation. In Settings, **?** opens detailed help.
 
-## 4. Add a Looper Manager
+## 4. Add a QLooper Manager
 
-1. Add another Looper and a **Looper Manager** from the built-in nodes.
-2. Wire the Manager's **MIDI output to each Looper's MIDI input** in that graph.
+1. Add another QLooper and a **QLooper Manager** from the built-in nodes.
+2. Wire the Manager's **MIDI output to each QLooper's MIDI input** in that graph.
    Connect the hardware MIDI input to the Manager if you use shared pedals.
 3. Open the Manager. Its boxes control individual loopers; **Play All / Stop All**
    control the group. **Active** identifies the looper receiving shared commands.
@@ -71,20 +71,20 @@ The labels in the current editor show the shortcuts. MIDI is optional.
 ## 5. Sections and the combined view
 
 - Prepare section graphs (for example Verse and Chorus), with their audio paths
-  connected to the parent graph. Each can contain its own Looper Manager/effects.
+  connected to the parent graph. Each can contain its own QLooper Manager/effects.
 - Add **Song Manager** at the parent level. Add the prepared sections to its list
   in the order you need. Next section uses its timing settings; a double-click on
   a section switches immediately. **Panic** silences the song; **Restore audio**
   restores sound without restarting stopped loops.
-- Open **Window → Looper View**. It brings Song Manager, Looper Manager, the shown
-  Looper and layers together. Missing modules are shown as empty areas.
+- Open **Window → QLooper View**. It brings Song Manager, QLooper Manager, the shown
+  QLooper and layers together. Missing modules are shown as empty areas.
 - The arrows above the looper change the **displayed** looper. Use the Manager
   to change MIDI/pedal control. Split / Loopers / Layers changes the space allocation.
 
 ## Optional effects, tuner and metronome
 
 Add your own compatible AU/VST3/LV2 effects in Element's plugin panel and route
-**Audio In → effect → Looper → Audio Out** to record that effect, or put effects
+**Audio In → effect → QLooper → Audio Out** to record that effect, or put effects
 after the looper to process playback. Install/scan external plugins separately.
 
 The compact tuner integration expects x42 Instrument Tuner and our optional

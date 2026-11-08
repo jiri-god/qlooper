@@ -812,7 +812,7 @@ void GuiService::getCommandInfo (CommandID commandID, ApplicationCommandInfo& re
             result.addDefaultKeypress (',', ModifierKeys::commandModifier);
             break;
         case Commands::showLooperView:
-            result.setInfo("Looper View", "Show the song, loopers and layers in one live window.", "Window", 0);
+            result.setInfo("QLooper View", "Show the song, loopers and layers in one live window.", "Window", 0);
             break;
         case Commands::showAllPluginWindows:
             result.addDefaultKeypress ('w', ModifierKeys::commandModifier | ModifierKeys::altModifier | ModifierKeys::shiftModifier);
@@ -997,7 +997,7 @@ bool GuiService::perform (const InvocationInfo& info)
         case Commands::showLooperView: {
             if (!looperViewWindow) {
                 struct RigWindow final : DocumentWindow {
-                    RigWindow():DocumentWindow("Looper View",Colour(0xff202731),DocumentWindow::allButtons){setUsingNativeTitleBar(true);}
+                    RigWindow():DocumentWindow("QLooper View",Colour(0xff202731),DocumentWindow::allButtons){setUsingNativeTitleBar(true);}
                     void closeButtonPressed() override {setVisible(false);}
                 };
                 looperViewWindow=std::make_unique<RigWindow>();

@@ -52,7 +52,7 @@ bool same(const Node& a,const Node& b){return a==b && a.getObject()==b.getObject
 }
 struct LooperRigView::Impl final : Component, Timer {
     LooperRigView& owner;std::function<Node()> rootGetter;GuiService* gui;
-    EditorPane song{"No Song Manager in this graph"}, manager{"No Looper Manager in this section"},small{"No loopers in this section"},layers{"No looper selected"};
+    EditorPane song{"No Song Manager in this graph"}, manager{"No QLooper Manager in this section"},small{"No loopers in this section"},layers{"No looper selected"};
     EditorPane tunerPane{"Open the tuner here after closing its other editor"};
     Label viewName,sectionName,tunerStatus;
     std::unique_ptr<TempoAndMeterBar> tempo;std::unique_ptr<TransportBar> transport;
@@ -65,8 +65,8 @@ struct LooperRigView::Impl final : Component, Timer {
         for(Component* c:std::initializer_list<Component*>{&tunerPane,&song,&manager,&small,&layers,&viewName,&sectionName,&tunerStatus,&previous,&next,&tunerOpen,&metronome})addAndMakeVisible(c);
         sectionName.setJustificationType(Justification::centredLeft);viewName.setJustificationType(Justification::centred);
         previous.setComponentID("rig-view-previous");next.setComponentID("rig-view-next");
-        previous.setTooltip("Show the previous looper. For switching pedal control, timed transitions or recording, use the Looper Manager above right. Configure behaviour in the looper and manager settings.");next.setTooltip("Show the next looper. For switching pedal control, timed transitions or recording, use the Looper Manager above right. Configure behaviour in the looper and manager settings.");
-        viewName.setTooltip("Currently displayed looper. Browsing here does not change pedal control or playback. Use the Looper Manager to control which looper is active.");
+        previous.setTooltip("Show the previous looper. For switching pedal control, timed transitions or recording, use the QLooper Manager above right. Configure behaviour in the looper and manager settings.");next.setTooltip("Show the next looper. For switching pedal control, timed transitions or recording, use the QLooper Manager above right. Configure behaviour in the looper and manager settings.");
+        viewName.setTooltip("Currently displayed looper. Browsing here does not change pedal control or playback. Use the QLooper Manager to control which looper is active.");
         previous.onClick=[this]{browse(-1);};next.onClick=[this]{browse(1);};
         const StringArray names{"Split","Loopers","Layers"};for(int i=0;i<3;++i){auto& b=modes[i];b.setButtonText(names[i]);b.setComponentID("rig-mode-"+String(i));addAndMakeVisible(b);b.onClick=[this,i]{setMode(i);};}
         tunerOpen.onClick=[this]{if(gui&&tuner.isValid())gui->presentPluginWindow(tuner,true);};

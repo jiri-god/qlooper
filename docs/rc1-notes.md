@@ -6,7 +6,7 @@ Feature development is frozen while real-rig testing continues.
 - Apple Silicon build; deployment target macOS 14. Current testing is on macOS 26.
 - The initial local DMG is ad-hoc signed, **not Developer ID signed or notarized**.
 - Tuner (x42), metronome (TICK) and third-party effects are optional external plugins.
-- Switching sessions with Looper View open can leave the embedded tuner black;
+- Switching sessions with QLooper View open can leave the embedded tuner black;
   restarting the host is the known workaround. No tuner binary is shipped here.
 - Large layer limits, long recordings and high sample rates can use substantial
   RAM. Start with defaults at 44.1/48 kHz and 128/256 samples, then test your rig.

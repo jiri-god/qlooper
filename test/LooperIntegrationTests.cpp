@@ -10,6 +10,7 @@
 #include "engine/internalformat.hpp"
 #include "nodes/audioprocessor.hpp"
 #include "nodes/looper.hpp"
+#include "nodes/looperbranding.hpp"
 #include "nodes/contexthelp.hpp"
 #include "nodes/looperkeyboard.hpp"
 #include "nodes/loopermanager.hpp"
@@ -80,6 +81,30 @@ void fillInput (AudioBuffer<float>& audio, float left, float right)
 } // namespace
 
 BOOST_AUTO_TEST_SUITE (LooperIntegrationTests)
+
+BOOST_AUTO_TEST_CASE (QLooperBrandingPreservesIdentifiersAndExistingNames)
+{
+    LooperProcessor looper;
+    LooperManagerNode manager;
+    PluginDescription ld, md;
+    looper.fillInPluginDescription(ld);
+    manager.getPluginDescription(md);
+    BOOST_CHECK_EQUAL(ld.name, "QLooper");
+    BOOST_CHECK_EQUAL(ld.fileOrIdentifier, "element.looper");
+    BOOST_CHECK_EQUAL(md.name, "QLooper Manager");
+    BOOST_CHECK_EQUAL(md.fileOrIdentifier, "element.looperManager");
+    ValueTree nodes("nodes"), legacy("node"), named("node"), numbered("node");
+    legacy.setProperty(tags::name,"Looper 1",nullptr);
+    named.setProperty(tags::name,"My rhythm",nullptr);
+    numbered.setProperty(tags::name,"QLooper 1",nullptr);
+    nodes.addChild(legacy,-1,nullptr);nodes.addChild(named,-1,nullptr);
+    BOOST_CHECK_EQUAL(nextQLooperName(nodes),"QLooper 1");
+    nodes.addChild(numbered,-1,nullptr);
+    BOOST_CHECK_EQUAL(nextQLooperName(nodes),"QLooper 2");
+    BOOST_CHECK_EQUAL(legacy.getProperty(tags::name).toString(),"Looper 1");
+    BOOST_CHECK_EQUAL(named.getProperty(tags::name).toString(),"My rhythm");
+}
+
 
 BOOST_AUTO_TEST_CASE(ContextHelpKeepsDetailsAndScopesSuppression)
 {

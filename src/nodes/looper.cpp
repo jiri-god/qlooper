@@ -277,7 +277,7 @@ LooperProcessor::~LooperProcessor() { stopTimer();if(historyFuture.valid())histo
 void LooperProcessor::fillInPluginDescription (PluginDescription& d) const
 {
     d.name = getName();
-    d.descriptiveName = "Layered Stereo Looper";
+    d.descriptiveName = "QLooper - layered stereo looper";
     d.fileOrIdentifier = EL_NODE_ID_LOOPER;
     d.pluginFormatName = "Element";
     d.manufacturerName = EL_NODE_FORMAT_AUTHOR;
@@ -1835,7 +1835,7 @@ public:
         generalControls.push_back(&customNameCount);generalControls.push_back(&customNameLabel);generalControls.push_back(&customName);
         customName.onTextChange=[this]{if(customName.getText().length()>12)customName.setText(customName.getText().substring(0,12),false);customNameCount.setText(String(customName.getText().length())+"/12",dontSendNotification);};
         customName.onReturnKey=[this]{commitName();};customName.onFocusLost=[this]{commitName();};
-        titleLabel.setText("Looper",dontSendNotification);titleLabel.setFont(FontOptions(15.0f,Font::bold));
+        titleLabel.setText("QLooper",dontSendNotification);titleLabel.setFont(FontOptions(15.0f,Font::bold));
         activeButton.onClick=[this]{if(!activeButton.active)owner.activeRequested=true;};
         activeButton.setTooltip("Select this looper for pedal control. Select another looper to transfer control.");
         display.setComponentID("looper-status-display");display.setJustificationType(Justification::centred);display.setFont(FontOptions(19.0f));

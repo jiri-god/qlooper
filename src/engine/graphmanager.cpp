@@ -7,6 +7,7 @@
 #include "engine/graphmanager.hpp"
 #include "element/tags.hpp"
 #include "nodes/audioprocessor.hpp"
+#include "nodes/looperbranding.hpp"
 #include "nodes/audiorouter.hpp"
 #include "nodes/midichannelsplitter.hpp"
 #include "nodes/midiprogrammap.hpp"
@@ -431,7 +432,7 @@ uint32 GraphManager::addNode (const PluginDescription* desc, double rx, double r
             .setProperty (tags::format, desc->pluginFormatName, nullptr)
             .setProperty (tags::identifier, desc->fileOrIdentifier, nullptr)
             .setProperty (tags::type, object->getTypeString(), nullptr)
-            .setProperty (tags::name, desc->name, nullptr)
+            .setProperty (tags::name, desc->pluginFormatName == "Element" && desc->fileOrIdentifier == "element.looper" ? nextQLooperName (nodes) : desc->name, nullptr)
             .setProperty (tags::object, object, nullptr)
             .setProperty (tags::updater, new NodeModelUpdater (*this, data, object), nullptr)
             .setProperty (tags::relativeX, rx, nullptr)

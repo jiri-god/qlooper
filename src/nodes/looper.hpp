@@ -94,7 +94,7 @@ public:
     juce::String historyMessage; // message thread
     bool importHistorySelection(int first,int last);
 
-    const juce::String getName() const override { return "Looper"; }
+    const juce::String getName() const override { return "QLooper"; }
     void fillInPluginDescription (juce::PluginDescription&) const override;
     void prepareToPlay (double, int) override;
     void releaseResources() override {}
