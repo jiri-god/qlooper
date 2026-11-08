@@ -23,6 +23,16 @@ using namespace element;
 using namespace juce;
 
 namespace {
+// Timers refresh asynchronously; CI scheduling is not a 100 ms guarantee.
+template <typename Predicate>
+bool waitForUi (Predicate ready)
+{
+    const auto deadline = Time::getMillisecondCounterHiRes() + 3000.0;
+    while (! ready() && Time::getMillisecondCounterHiRes() < deadline)
+        MessageManager::getInstance()->runDispatchLoopUntil (20);
+    return ready();
+}
+
 class RecordingEffect final : public TestNode
 {
 public:
@@ -406,7 +416,7 @@ BOOST_AUTO_TEST_CASE(DetachedLayersWindowResizesReopensAndClosesWithEditor)
     MessageManager::getInstance()->runDispatchLoopUntil(100);
     BOOST_CHECK_EQUAL(preview->getName(),"Selected layer "+String(before.layers[0].id));
     BOOST_REQUIRE(p.editLayer(before.layers[0].id,3,0));p.serviceOfflineControls();
-    MessageManager::getInstance()->runDispatchLoopUntil(100);
+    BOOST_REQUIRE(waitForUi([&]{return preview->getName()=="No selected layer";}));
     BOOST_CHECK_EQUAL(preview->getName(),"No selected layer");
     window->closeButtonPressed();BOOST_CHECK(!window->isVisible());open->onClick();BOOST_CHECK(window->isVisible());
     auto* fold=find(find,*editor,"Hide");BOOST_REQUIRE(fold);fold->onClick();BOOST_CHECK_EQUAL(editor->getHeight(),420);
@@ -566,13 +576,17 @@ BOOST_AUTO_TEST_CASE (ManagerCompactControlsAndMasterDropRegression)
     auto render=[&]{RenderContext rc(audio,audio,midi,8);graph.render(rc);a->view();b->view();};render();
     ValueTree data(types::Node);data.setProperty(tags::object,managerNode,nullptr);Node node(data,false);LooperManagerEditor editor(node);
     std::function<Component*(Component&,const String&)> find=[&](Component& c,const String& id)->Component*{if(c.getComponentID()==id)return &c;for(auto* child:c.getChildren())if(auto* result=find(*child,id))return result;return nullptr;};
+    // Keep this non-interactive fixture away from the real pointer: hover intentionally
+    // suppresses slider refresh while a user is interacting with a control.
+    editor.setTopLeftPosition(-10000,-10000);
     const auto aid=String(an->nodeId),bid=String(bn->nodeId);
     auto* record=dynamic_cast<Button*>(find(editor,"manager-record-"+aid));BOOST_REQUIRE(record);
     BOOST_REQUIRE(a->view().needsClock);BOOST_CHECK_EQUAL(record->getButtonText().toStdString(),"Record");
     auto* volume=dynamic_cast<Slider*>(find(editor,"manager-volume-"+aid));auto* pan=dynamic_cast<Slider*>(find(editor,"manager-pan-"+aid));BOOST_REQUIRE(volume);BOOST_REQUIRE(pan);
     const auto selected=manager->selectedID();volume->setValue(.37,sendNotificationSync);pan->setValue(-.45,sendNotificationSync);
     BOOST_CHECK_CLOSE(a->getVolume(),.37f,.01f);BOOST_CHECK_CLOSE(a->getPan(),-.45f,.01f);BOOST_CHECK_EQUAL(manager->selectedID(),selected);
-    a->setVolume(.6f);a->setPan(.3f);MessageManager::getInstance()->runDispatchLoopUntil(100);
+    a->setVolume(.6f);a->setPan(.3f);
+    BOOST_REQUIRE(waitForUi([&]{return std::abs(volume->getValue()-.6)<.0001 && std::abs(pan->getValue()-.3)<.0001;}));
     BOOST_CHECK_CLOSE(float(volume->getValue()),.6f,.01f);BOOST_CHECK_CLOSE(float(pan->getValue()),.3f,.01f);
     auto* target=dynamic_cast<DragAndDropTarget*>(find(editor,"manager-master-drop"));BOOST_REQUIRE(target);
     DragAndDropTarget::SourceDetails first("jgod-looper:"+aid,find(editor,"manager-card-"+aid),{10,10});
