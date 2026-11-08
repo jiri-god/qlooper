@@ -1,0 +1,534 @@
+// Copyright 2023 Kushview, LLC <info@kushview.net>
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#pragma once
+
+#include <element/juce/core.hpp>
+#include <element/juce/audio_basics.hpp>
+#include <element/juce/osc.hpp>
+
+namespace element {
+namespace Util {
+
+inline static juce::juce_wchar defaultPasswordChar() noexcept
+{
+#if JUCE_LINUX
+    return 0x2022;
+#else
+    return 0x25cf;
+#endif
+}
+
+/** Display minutes in decimal as min:sec */
+inline static String minutesToString (const double input)
+{
+    double minutes = 0, seconds = 60.0 * modf (input, &minutes);
+    String ms (juce::roundToInt (floor (minutes)));
+    String mm (juce::roundToInt (floor (seconds)));
+    return ms.paddedLeft ('0', 2) + ":" + mm.paddedLeft ('0', 2);
+}
+
+/** Display seconds in decimal as min:sec */
+inline static String secondsToString (const double input)
+{
+    return minutesToString (input / 60.0);
+}
+
+/** The octave number given to middle C (MIDI note 60) everywhere note names are
+    displayed or parsed.
+
+    Element uses scientific pitch notation, middle C = C4, which is what most DAWs
+    show. Anything naming a MIDI note should go through noteValueToString() or use
+    this constant rather than passing its own number to juce::MidiMessage.
+*/
+inline constexpr int middleCOctave = 4;
+
+/** Converts a MIDI note number to its note name, e.g. "C4", "F#2", "A0".
+
+    @param value the MIDI note number, rounded to the nearest integer
+    @return the note name including its octave number
+*/
+inline static String noteValueToString (double value)
+{
+    return juce::MidiMessage::getMidiNoteName (juce::roundToInt (value), true, true, middleCOctave);
+}
+
+/** Parses a note name (e.g. "C4", "F#2", "Eb4") or a raw MIDI number into a
+    MIDI note number 0-127.
+
+    Uses the same octave-for-middle-C convention as noteValueToString (middle C = C4),
+    so this is the inverse of that function.
+
+    @param text             the text to parse
+    @param octaveForMiddleC the octave number assigned to middle C (note 60)
+    @return the MIDI note number 0-127, or -1 if the text cannot be parsed
+*/
+inline static int noteValueFromString (const juce::String& text, int octaveForMiddleC = middleCOctave)
+{
+    const auto trimmed = text.trim();
+    if (trimmed.isEmpty())
+        return -1;
+
+    const auto first = trimmed[0];
+    const auto upperFirst = juce::CharacterFunctions::toUpperCase (first);
+
+    if (upperFirst >= 'A' && upperFirst <= 'G')
+    {
+        // Pitch classes for A..G.
+        static const int pitchClasses[] = { 9, 11, 0, 2, 4, 5, 7 };
+        int note = pitchClasses[upperFirst - 'A'];
+
+        // Accidentals: '#'/'s' raise, lowercase 'b' lowers (so the note letter
+        // 'B' is never mistaken for a flat).
+        int i = 1;
+        for (; i < trimmed.length(); ++i)
+        {
+            const auto c = trimmed[i];
+            if (c == '#' || c == 's' || c == 'S')
+                ++note;
+            else if (c == 'b')
+                --note;
+            else
+                break;
+        }
+
+        const auto octaveStr = trimmed.substring (i).trim();
+        if (octaveStr.isEmpty() || ! octaveStr.containsOnly ("0123456789-"))
+            return -1;
+
+        note += 12 * (octaveStr.getIntValue() - octaveForMiddleC + 5);
+        return juce::jlimit (0, 127, note);
+    }
+
+    // Fall back to a raw MIDI note number.
+    if (trimmed.containsOnly ("0123456789-"))
+        return juce::jlimit (0, 127, trimmed.getIntValue());
+
+    return -1;
+}
+
+/** Returns the application name depending on product.
+    Element Lite, Element Solo, or Element
+ */
+inline static String appName (const String& beforeText = String(),
+                              const String& afterText = String())
+{
+    String name;
+    if (beforeText.isNotEmpty())
+        name << beforeText;
+
+    name << "Element";
+
+    if (afterText.isNotEmpty())
+        name << afterText;
+
+    return name;
+}
+
+inline static bool isGmailExtended (const String& email)
+{
+    if (! juce::URL::isProbablyAnEmailAddress (email))
+        return false;
+    if (! email.toLowerCase().contains ("gmail.com"))
+        return false;
+    if (! email.toLowerCase().upToFirstOccurrenceOf ("gmail.com", false, true).containsAnyOf (".+"))
+        return false;
+
+    return email.fromFirstOccurrenceOf ("+", true, true)
+                   .upToFirstOccurrenceOf ("@gmail.com", false, true)
+                   .length()
+               >= 1
+           || email.fromFirstOccurrenceOf (".", true, true)
+                      .upToFirstOccurrenceOf ("@gmail.com", false, true)
+                      .length()
+                  >= 1;
+}
+
+//=============================================================================
+inline static bool isValidOscPort (int port)
+{
+    return port > 0 && port < 65536;
+}
+
+inline static std::vector<std::string> parseOscAddressPaths (const juce::OSCMessage& message)
+{
+    /** AddressPattern.oscSymbols is already parsed, but it's a private member */
+    const auto addr = message.getAddressPattern().toString().toStdString();
+
+    /** Parts: I/O Type, Device Name, Command */
+
+    std::vector<std::string> paths;
+
+    std::string delimiter = "/";
+    std::string part = "";
+    std::size_t currentPos = 0;
+    std::size_t nextPos = 0;
+
+    while (currentPos != std::string::npos)
+    {
+        currentPos = addr.find (delimiter, currentPos);
+        nextPos = addr.find (delimiter, currentPos + 1);
+        part = addr.substr (currentPos + 1, (nextPos - 1) - currentPos);
+        currentPos = nextPos;
+        if (part == "")
+            continue;
+
+        paths.push_back (part);
+    }
+
+    for (size_t i = paths.size(); i < 3; i++)
+        paths.push_back ("");
+
+    return paths;
+}
+
+inline static juce::var getOscArgumentAsPrimitiveValue (const juce::OSCArgument& arg)
+{
+    if (arg.isFloat32())
+        return arg.getFloat32();
+    if (arg.isInt32())
+        return arg.getInt32();
+    if (arg.isString())
+        return arg.getString();
+    return 0;
+}
+
+inline static String getOscArgumentAsString (const juce::OSCArgument& arg)
+{
+    String type;
+    String value;
+
+    if (arg.isFloat32())
+    {
+        type = "float32";
+        value = String (arg.getFloat32());
+    }
+    else if (arg.isInt32())
+    {
+        type = "int32";
+        value = String (arg.getInt32());
+    }
+    else if (arg.isString())
+    {
+        type = "string";
+        value = arg.getString();
+    }
+    else if (arg.isBlob())
+    {
+        type = "blob";
+        auto& blob = arg.getBlob();
+        value = String::fromUTF8 ((const char*) blob.getData(), (int) blob.getSize());
+    }
+    else
+    {
+        type = "unknown";
+        value = "value";
+    }
+    return type + " " + value;
+}
+
+inline static String getOscMessageAsString (const juce::OSCMessage& message)
+{
+    juce::OSCAddressPattern addressPattern = message.getAddressPattern();
+    String str = addressPattern.toString();
+
+    if (message.isEmpty())
+        return str;
+
+    str += " ";
+    int i = 0;
+    for (auto& arg : message)
+    {
+        if (i > 0)
+            str += ", ";
+        str += getOscArgumentAsString (arg);
+        i++;
+    }
+
+    return str;
+}
+
+inline static juce::MidiMessage processOscToMidiMessage (const juce::OSCMessage& message)
+{
+    std::vector<std::string> paths = parseOscAddressPaths (message);
+
+    if (paths[0] != "midi")
+    {
+        return juce::MidiMessage();
+    }
+
+    std::string deviceName;
+    std::string command;
+
+    /** /midi/{command} or /midi/{deviceName}/{command} */
+
+    if (paths[2] == "")
+    {
+        deviceName = "";
+        command = paths[1];
+    }
+    else if (paths[1] != "")
+    {
+        deviceName = paths[1];
+        command = paths[2];
+    }
+    else
+    {
+        return juce::MidiMessage();
+    }
+
+    /** Cast the rest of values to their respective types */
+
+    const int numArgs = message.size();
+    std::unique_ptr<juce::var[]> values;
+    values.reset (new juce::var[numArgs]);
+
+    int blobIndexInMessage = -1;
+
+    int i = 0;
+    for (auto& arg : message)
+    {
+        if (arg.isBlob())
+        {
+            blobIndexInMessage = i;
+            values[i] = 0;
+        }
+        else
+        {
+            values[i] = getOscArgumentAsPrimitiveValue (arg);
+        }
+        i++;
+    }
+
+    /** Commands - See https://docs.juce.com/master/classMidiMessage.html#pub-static-methods */
+
+    if (command == "raw")
+    {
+        if (blobIndexInMessage >= 0)
+        {
+            const juce::MemoryBlock& blob = message[blobIndexInMessage].getBlob();
+            // return String::fromUTF8 ((const char*) blob.getData(), (int) blob.getSize());
+            return juce::MidiMessage (blob.getData(), (int) blob.getSize());
+        }
+    }
+    else if (command == "noteOn")
+    {
+        if (numArgs >= 3)
+        {
+            /** channel, noteNumber, velocity */
+            return juce::MidiMessage::noteOn ((int) values[0], (int) values[1], (float) values[2]);
+        }
+    }
+    else if (command == "noteOff")
+    {
+        if (numArgs >= 3)
+        {
+            /** channel, noteNumber, velocity */
+            return juce::MidiMessage::noteOff ((int) values[0], (int) values[1], (float) values[2]);
+        }
+    }
+    else if (command == "programChange")
+    {
+        if (numArgs >= 2)
+        {
+            /** channel, programNumber */
+            return juce::MidiMessage::programChange ((int) values[0], (int) values[1]);
+        }
+    }
+    else if (command == "pitchBend" || command == "pitchWheel")
+    {
+        if (numArgs >= 2)
+        {
+            /** channel, position */
+            return juce::MidiMessage::pitchWheel ((int) values[0], (int) values[1]);
+        }
+    }
+    else if (command == "afterTouch")
+    {
+        if (numArgs >= 2)
+        {
+            /** channel, noteNumber, aftertouchAmount */
+            return juce::MidiMessage::aftertouchChange ((int) values[0], (int) values[1], (int) values[2]);
+        }
+    }
+    else if (command == "channelPressure")
+    {
+        if (numArgs >= 2)
+        {
+            /** channel, pressure */
+            return juce::MidiMessage::noteOff ((int) values[0], (int) values[1]);
+        }
+    }
+    else if (command == "controlChange")
+    {
+        if (numArgs >= 3)
+        {
+            /** channel, controllerType, value */
+            return juce::MidiMessage::controllerEvent ((int) values[0], (int) values[1], (int) values[2]);
+        }
+    }
+    else if (command == "allNotesOff")
+    {
+        if (numArgs >= 1)
+        {
+            /** channel */
+            return juce::MidiMessage::allNotesOff ((int) values[0]);
+        }
+    }
+    else if (command == "allSoundOff")
+    {
+        if (numArgs >= 1)
+        {
+            /** channel */
+            return juce::MidiMessage::allSoundOff ((int) values[0]);
+        }
+    }
+    else if (command == "allControllersOff")
+    {
+        if (numArgs >= 1)
+        {
+            /** channel */
+            return juce::MidiMessage::allControllersOff ((int) values[0]);
+        }
+    }
+    else if (command == "start")
+    {
+        return juce::MidiMessage::midiStart();
+    }
+    else if (command == "continue")
+    {
+        return juce::MidiMessage::midiContinue();
+    }
+    else if (command == "stop")
+    {
+        return juce::MidiMessage::midiStop();
+    }
+    else if (command == "clock")
+    {
+        return juce::MidiMessage::midiClock();
+    }
+    else if (command == "songPositionPointer")
+    {
+        if (numArgs >= 1)
+        {
+            /** positionInMidiBeats */
+            return juce::MidiMessage::songPositionPointer ((int) values[0]);
+        }
+    }
+    else if (command == "activeSense")
+    {
+        return juce::MidiMessage();
+    }
+
+    // Command "polyPressure" not supported?
+
+    /** Unknown command */
+    return juce::MidiMessage();
+}
+
+inline static juce::OSCMessage processMidiToOscMessage (const juce::MidiMessage& m)
+{
+    /** Address: /midi/{command} or /midi/{deviceName}/{command} */
+
+    String path = "/midi/";
+
+    const int channel = m.getChannel();
+
+    if (m.isNoteOn())
+    {
+        return juce::OSCMessage (path + "noteOn", channel, m.getNoteNumber(), m.getFloatVelocity());
+    }
+    else if (m.isNoteOff())
+    {
+        return juce::OSCMessage (path + "noteOff", channel, m.getNoteNumber(), m.getFloatVelocity());
+    }
+    else if (m.isProgramChange())
+    {
+        return juce::OSCMessage (path + "programChange", channel, m.getProgramChangeNumber());
+    }
+    else if (m.isPitchWheel())
+    {
+        return juce::OSCMessage (path + "pitchBend", channel, m.getPitchWheelValue());
+    }
+    else if (m.isAftertouch())
+    {
+        return juce::OSCMessage (path + "afterTouch", channel, m.getNoteNumber(), m.getAfterTouchValue());
+    }
+    else if (m.isChannelPressure())
+    {
+        return juce::OSCMessage (path + "channelPressure", channel, m.getChannelPressureValue());
+    }
+    else if (m.isController())
+    {
+        return juce::OSCMessage (path + "controlChange", channel, m.getControllerNumber(), m.getControllerValue());
+    }
+    else if (m.isAllNotesOff())
+    {
+        return juce::OSCMessage (path + "allNotesOff");
+    }
+    else if (m.isAllSoundOff())
+    {
+        return juce::OSCMessage (path + "allNotesOff");
+    }
+    else if (m.isResetAllControllers())
+    {
+        return juce::OSCMessage (path + "allControllersOff");
+    }
+    else if (m.isMidiStart())
+    {
+        return juce::OSCMessage (path + "start");
+    }
+    else if (m.isMidiContinue())
+    {
+        return juce::OSCMessage (path + "continue");
+    }
+    else if (m.isMidiStop())
+    {
+        return juce::OSCMessage (path + "stop");
+    }
+    else if (m.isMidiClock())
+    {
+        return juce::OSCMessage (path + "clock");
+    }
+    else if (m.isSongPositionPointer())
+    {
+        return juce::OSCMessage (path + "songPositionPointer", m.getSongPositionPointerMidiBeat());
+    }
+    else if (m.isActiveSense())
+    {
+        return juce::OSCMessage (path + "activeSense");
+    }
+
+    return juce::OSCMessage (path + "unknown");
+}
+
+inline static String toBase64 (const String& input)
+{
+    return juce::Base64::toBase64 (input);
+}
+
+inline static String fromBase64 (const String& input)
+{
+    juce::MemoryOutputStream mo;
+    juce::Base64::convertFromBase64 (mo, input);
+    return mo.toString();
+}
+
+StringArray compiledAudioPluginFormats();
+bool isRunningInWine();
+
+} // namespace Util
+
+class DataURI
+{
+public:
+    static String encode (const String& mimetype, const String& text, bool base64, bool gzip)
+    {
+        String result = "data:";
+        result << mimetype << ";";
+        if (gzip)
+            result << "gzip;base64, ";
+        return result;
+    }
+};
+} // namespace element

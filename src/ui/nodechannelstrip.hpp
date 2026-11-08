@@ -1,0 +1,414 @@
+// Copyright 2023 Kushview, LLC <info@kushview.net>
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#pragma once
+
+#include <element/ui.hpp>
+#include <element/processor.hpp>
+#include <element/signals.hpp>
+
+#include "ElementApp.h"
+#include "ui/channelstrip.hpp"
+#include "services/sessionservice.hpp"
+
+namespace element {
+
+class NodeChannelStripComponent : public Component,
+                                  public Timer,
+                                  public ComboBox::Listener,
+                                  private Value::Listener
+{
+public:
+    std::function<void()> onNodeChanged;
+    NodeChannelStripComponent (GuiService& g, bool handleNodeSelected = true)
+        : gui (g), listenForNodeSelected (handleNodeSelected)
+    {
+        addAndMakeVisible (channelStrip);
+        addAndMakeVisible (nodeName);
+        nodeName.setText ("", dontSendNotification);
+        nodeName.setJustificationType (Justification::centredBottom);
+        nodeName.setEditable (false, true, false);
+        nodeName.setFont (Font (FontOptions (Style::fontSizeDefault)));
+        nodeName.onTextChange = [this] {
+            if (node.isValid())
+                node.setProperty (tags::name, nodeName.getText());
+        };
+
+        addAndMakeVisible (channelBox);
+        channelBox.setJustificationType (Justification::centred);
+
+        addAndMakeVisible (flowBox);
+        flowBox.setJustificationType (Justification::centred);
+
+        bindSignals();
+    }
+
+    ~NodeChannelStripComponent()
+    {
+        unbindSignals();
+    }
+
+    ChannelStripComponent& getChannelStrip() { return channelStrip; }
+
+    void setVolumeMinMax (double minDb, double maxDb, double skew = 2.0)
+    {
+        channelStrip.setMinMaxDecibels (minDb, maxDb);
+        channelStrip.setFaderSkewFactor (skew);
+    }
+
+    void bindSignals()
+    {
+        unbindSignals();
+        displayName.addListener (this);
+        nodeColor.addListener (this);
+        flowBox.addListener (this);
+        if (listenForNodeSelected)
+            nodeSelectedConnection = gui.nodeSelected.connect (
+                std::bind (&NodeChannelStripComponent::nodeSelected, this));
+        volumeChangedConnection = channelStrip.volumeChanged.connect (
+            std::bind (&NodeChannelStripComponent::volumeChanged, this, std::placeholders::_1));
+        powerChangedConnection = channelStrip.powerChanged.connect (
+            std::bind (&NodeChannelStripComponent::powerChanged, this));
+        muteChangedConnection = channelStrip.muteChanged.connect (
+            std::bind (&NodeChannelStripComponent::muteChanged, this));
+        volumeDoubleClickedConnection = channelStrip.volumeLabelDoubleClicked.connect (
+            std::bind (&NodeChannelStripComponent::setUnityGain, this));
+    }
+
+    void unbindSignals()
+    {
+        for (auto& c : _conns)
+            c.disconnect();
+        _conns.clear();
+
+        displayName.removeListener (this);
+        nodeColor.removeListener (this);
+        flowBox.removeListener (this);
+        nodeSelectedConnection.disconnect();
+        volumeChangedConnection.disconnect();
+        powerChangedConnection.disconnect();
+        muteChangedConnection.disconnect();
+        volumeDoubleClickedConnection.disconnect();
+    }
+
+    void resized() override
+    {
+        auto r (getLocalBounds());
+        nodeName.setBounds (r.removeFromTop (22).reduced (2));
+        r.removeFromTop (10); // padding between strip title and IO boxes
+
+        auto r2 = r.removeFromBottom (jmin (268, r.getHeight()));
+        int boxSize = r2.getWidth() - 8;
+        flowBox.setBounds (r2.removeFromTop (16).withSizeKeepingCentre (boxSize, 14));
+        channelBox.setBounds (r2.removeFromTop (16).withSizeKeepingCentre (boxSize, 14));
+        channelStrip.setBounds (r2);
+    }
+
+    inline virtual void paint (Graphics& g) override
+    {
+        g.setColour (Colors::widgetBackgroundColor);
+        g.fillAll();
+        g.setColour (Colors::backgroundColor);
+        g.fillRect (getWidth() - 1, 0, 1, getHeight());
+    }
+
+    inline void timerCallback() override
+    {
+        auto& meter = channelStrip.getSimpleMeter();
+        if (ProcessorPtr ptr = node.getObject())
+        {
+            const int startChannel = jmax (0, channelBox.getSelectedId() - 1);
+            if (ptr->getNumAudioOutputs() == 1)
+            {
+                if (isAudioOutNode)
+                    for (int c = 0; c < 2; ++c)
+                        meter.setValue (c, ptr->getInputRMS (startChannel));
+                else
+                    for (int c = 0; c < 2; ++c)
+                        meter.setValue (c, ptr->getOutputRMS (startChannel));
+            }
+            else
+            {
+                const int endChannel = startChannel + 2;
+                if (isAudioOutNode || isMonitoringInputs())
+                    for (int c = startChannel; c < endChannel; ++c)
+                        meter.setValue (c - startChannel, ptr->getInputRMS (c));
+                else
+                    for (int c = startChannel; c < endChannel; ++c)
+                        meter.setValue (c - startChannel, ptr->getOutputRMS (c));
+            }
+
+            const auto cv = getCurrentVolume();
+            if (static_cast<float> (channelStrip.getVolume()) != cv)
+                channelStrip.setVolume (cv, dontSendNotification);
+
+            channelStrip.setPower (! ptr->isSuspended(), false);
+            if (channelStrip.isMuted() != ptr->isMuted())
+                channelStrip.setMuted (ptr->isMuted(), false);
+        }
+        else
+        {
+            meter.resetPeaks();
+            stopTimer();
+        }
+
+        meter.refresh();
+    }
+
+    inline void stabilizeContent()
+    {
+        updateComboBoxes();
+        updateNodeName();
+        updateChannelStrip();
+    }
+
+    inline void updateChannelStrip()
+    {
+        if (ProcessorPtr object = node.getObject())
+        {
+            SharedConnectionBlock b1 (volumeChangedConnection);
+            SharedConnectionBlock b2 (powerChangedConnection);
+            SharedConnectionBlock b3 (muteChangedConnection);
+
+            channelStrip.setVolume (getCurrentVolume(), dontSendNotification);
+            channelStrip.setPower (! object->isSuspended(), false);
+            channelStrip.setMuted (object->isMuted(), false);
+
+            b1.unblock();
+            b2.unblock();
+            b3.unblock();
+        }
+    }
+
+    inline void setNodeNameEditable (const bool isEditable)
+    {
+        nodeName.setEditable (false, isEditable, false);
+    }
+
+    inline void setNode (const Node& newNode)
+    {
+        stopTimer();
+        node = newNode;
+        isAudioOutNode = node.isAudioOutputNode();
+        isAudioInNode = node.isAudioInputNode();
+        audioIns.clearQuick();
+        audioOuts.clearQuick();
+        node.getPorts (audioIns, audioOuts, PortType::Audio);
+        displayName.referTo (node.getPropertyAsValue (tags::name));
+        nodeColor.referTo (node.getUIValueTree().getPropertyAsValue ("color", nullptr));
+        stabilizeContent();
+        startTimerHz (meterSpeedHz);
+
+        if (onNodeChanged)
+            onNodeChanged();
+    }
+
+    inline Node getNode() const { return node; }
+
+    inline void setComboBoxesVisible (bool showChannelBox = true, bool showFlowBox = true)
+    {
+        useChannelBox = showChannelBox;
+        useFlowBox = showFlowBox;
+        updateComboBoxes();
+        resized();
+    }
+
+    /** @internal */
+    inline void comboBoxChanged (ComboBox* box) override
+    {
+        if (box == &flowBox)
+        {
+            updateComboBoxes (false, true);
+            updateChannelStrip();
+        }
+    }
+
+    /** Called when the volume slider changes. If this is set, you probably
+        also want to override getCurrentVolume() */
+    std::function<void (double)> onVolumeChanged;
+
+protected:
+    /** Override this to return volume from the backend/model layer. The
+        default returns either the input or output gain of the node */
+    virtual float getCurrentVolume()
+    {
+        ProcessorPtr object = node.getObject();
+        if (object == nullptr)
+            return 0.f;
+
+        float gain = isMonitoringInputs() || isAudioOutNode ? object->getInputGain() : object->getGain();
+        return Decibels::gainToDecibels (gain, (float) channelStrip.getMinDecibels());
+    }
+
+private:
+    friend class NodeChannelStripView;
+    GuiService& gui;
+    Label nodeName;
+    Node node;
+    PortArray audioIns, audioOuts;
+    ComboBox channelBox, flowBox;
+    ChannelStripComponent channelStrip;
+    bool listenForNodeSelected;
+
+    bool useFlowBox = true;
+    bool useChannelBox = true;
+
+    int meterSpeedHz = 15;
+    bool isAudioOutNode = false;
+    bool isAudioInNode = false;
+    [[maybe_unused]] bool monoMeter = false;
+
+    Value displayName;
+    Value nodeColor;
+
+    SignalConnection nodeSelectedConnection;
+    SignalConnection volumeChangedConnection;
+    SignalConnection powerChangedConnection;
+    SignalConnection volumeDoubleClickedConnection;
+    SignalConnection muteChangedConnection;
+    std::vector<boost::signals2::connection> _conns;
+
+    inline bool isMonitoringInputs() const { return flowBox.getSelectedId() == 1; }
+    inline bool isMonitoringOutputs() const { return flowBox.getSelectedId() == 2; }
+
+    void valueChanged (Value& value) override
+    {
+        if (value.refersToSameSourceAs (displayName) || value.refersToSameSourceAs (nodeColor))
+            updateNodeName();
+    }
+
+    void updateNodeName()
+    {
+        if (node.isValid())
+        {
+            nodeName.setText (node.getDisplayName(), dontSendNotification);
+            String tooltip = node.getDisplayName();
+            if (node.hasModifiedName())
+                tooltip << " (" << node.getPluginName() << ")";
+            nodeName.setTooltip (tooltip);
+
+            const auto color = node.getColor (Colours::transparentBlack);
+            const bool colorize = color != Colour (0x00000000);
+            nodeName.setColour (Label::backgroundColourId,
+                                colorize ? color : Colours::transparentBlack);
+            nodeName.setColour (Label::textColourId,
+                                colorize ? Colours::white.overlaidWith (color).contrasting()
+                                         : Colors::textColor);
+        }
+    }
+
+    void updateComboBoxes (bool doFlowBox = true, bool doChannelBox = true)
+    {
+        if (doFlowBox)
+        {
+            int flowId = flowBox.getSelectedId();
+            if (flowId <= 0)
+                flowId = 2;
+            flowBox.clear();
+            flowBox.setTooltip ("Signal flow to monitor");
+
+            if (audioIns.size() > 0)
+                flowBox.addItem ("Input", 1);
+            if (audioOuts.size() > 0)
+                flowBox.addItem ("Output", 2);
+
+            if (flowBox.getNumItems() > 0 && ! isAudioInNode && ! isAudioOutNode)
+            {
+                flowBox.setVisible (useFlowBox);
+                flowBox.setSelectedId (flowId, juce::dontSendNotification);
+                if (flowBox.getSelectedId() <= 0)
+                    flowBox.setSelectedItemIndex (0);
+            }
+            else
+            {
+                flowBox.setVisible (false);
+            }
+        }
+
+        if (doChannelBox)
+        {
+            channelBox.setTooltip ("Channel(s) to monitor");
+            channelBox.clear();
+
+            // audio out node ports flipped until more robust
+            auto& ports = isAudioOutNode ? audioIns : isMonitoringInputs() ? audioIns
+                                                                           : audioOuts;
+
+            const bool monoPorts = ports.size() % 2 != 0;
+            const int step = monoPorts ? 1 : 2;
+
+            for (int i = 0; i < ports.size(); i += step)
+            {
+                String text (int (i + 1));
+                if (! monoPorts)
+                    text << " - " << int (i + 2);
+                channelBox.addItem (text, i + 1);
+            }
+
+            if (channelBox.getNumItems() > 0)
+            {
+                channelBox.setVisible (useFlowBox);
+                channelBox.setSelectedItemIndex (0);
+            }
+            else
+            {
+                channelBox.setVisible (false);
+            }
+        }
+    }
+
+    void nodeSelected()
+    {
+        setNode (gui.getSelectedNode());
+    }
+
+    void powerChanged()
+    {
+        if (node.isValid())
+            node.setProperty (tags::bypass, ! channelStrip.isPowerOn());
+        if (auto* obj = node.getObject())
+            obj->suspendProcessing (! channelStrip.isPowerOn());
+    }
+
+    void volumeChanged (double value)
+    {
+        if (onVolumeChanged != nullptr)
+            return onVolumeChanged (value);
+
+        if (ProcessorPtr object = node.getObject())
+        {
+            auto gain = Decibels::decibelsToGain (value, channelStrip.getMinDecibels());
+            if (isAudioOutNode || isMonitoringInputs())
+            {
+                if (gain != (double) node.getProperty (tags::inputGain, gain) || gain != (double) object->getInputGain())
+                {
+                    node.setProperty (tags::inputGain, gain);
+                    object->setInputGain (static_cast<float> (gain));
+                }
+            }
+            else
+            {
+                if (gain != (double) node.getProperty (tags::gain, gain) || gain != (double) object->getGain())
+                {
+                    node.setProperty (tags::gain, gain);
+                    object->setGain (static_cast<float> (gain));
+                }
+            }
+        }
+    }
+
+    void muteChanged()
+    {
+        if (node.isValid())
+            node.setProperty (tags::mute, channelStrip.isMuted());
+        if (auto* obj = node.getObject())
+            obj->setMuted (channelStrip.isMuted());
+    }
+
+    void setUnityGain()
+    {
+        channelStrip.setVolume (0.0);
+    }
+};
+
+} // namespace element

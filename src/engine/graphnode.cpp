@@ -1,0 +1,895 @@
+// Copyright 2023 Kushview, LLC <info@kushview.net>
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include "engine/boundedmidi.hpp"
+#include <element/audioengine.hpp>
+#include <element/midipipe.hpp>
+#include <element/node.hpp>
+#include <element/portcount.hpp>
+#include <element/context.hpp>
+
+#include "engine/graphbuilder.hpp"
+#include "engine/ionode.hpp"
+#include "nodes/audioprocessor.hpp"
+#include "nodes/loopermanager.hpp"
+#include "nodes/songmanager.hpp"
+#include "nodes/recorder.hpp"
+#include "engine/graphnode.hpp"
+#include "tracer.hpp"
+
+#ifndef EL_GRAPH_NODE_NAME
+#define EL_GRAPH_NODE_NAME "Graph"
+#endif
+
+namespace element {
+
+bool GraphNode::consumeLooperTransportRequests(bool supported)
+{
+    const ScopedLock sl(seqLock);
+    bool start=false;
+    for(auto* node:renderNodes) {
+        if(auto* looper=dynamic_cast<LooperProcessor*>(node->getAudioProcessor())) {
+            looper->transportStartSupported.store(supported);
+            start=looper->transportStartRequested.exchange(false)||start;
+        }
+        if(auto* graph=dynamic_cast<GraphNode*>(node))start=graph->consumeLooperTransportRequests(supported)||start;
+    }
+    return supported && start;
+}
+void GraphNode::serviceOfflineControls()
+{
+    const ScopedLock sl(seqLock);
+    // First drain edits in every section, then select; no rendering or fake clock.
+    for(auto* node:renderNodes) {
+        if(auto* looper=dynamic_cast<LooperProcessor*>(node->getAudioProcessor())) looper->serviceOfflineControls();
+        if(auto* graph=dynamic_cast<GraphNode*>(node)) graph->serviceOfflineControls();
+    }
+    if(songManager) songManager->serviceOfflineSelection();
+    for(auto* node:renderNodes)
+        if(auto* manager=dynamic_cast<LooperManagerNode*>(node)) manager->serviceOfflineSelection();
+}
+
+GraphNode::Connection::Connection (const uint32 sourceNode_, const uint32 sourcePort_, const uint32 destNode_, const uint32 destPort_) noexcept
+    : Arc (sourceNode_, sourcePort_, destNode_, destPort_) {}
+
+GraphNode::GraphNode (Context& c)
+    : Processor (PortCount()
+                     .with (PortType::Audio, 2, 2)
+                     .with (PortType::Midi, 1, 1)
+                     .toPortList()),
+      _context (c),
+      lastNodeId (0),
+      renderingBuffers (1, 1),
+      currentAudioInputBuffer (nullptr),
+      currentAudioOutputBuffer (1, 1),
+      currentMidiInputBuffer (nullptr)
+{
+    for (int i = 0; i < IONode::numDeviceTypes; ++i)
+        ioNodes[i] = EL_INVALID_PORT;
+    setName (EL_GRAPH_NODE_NAME);
+}
+
+GraphNode::~GraphNode()
+{
+    renderingSequenceChanged.disconnect_all_slots();
+    clearRenderingSequence();
+    clear();
+}
+
+void GraphNode::clear()
+{
+    clearRenderingSequence();
+    nodes.clear();
+    connections.clear();
+}
+
+Processor* GraphNode::getNodeForId (const uint32 nodeId) const
+{
+    for (int i = nodes.size(); --i >= 0;)
+        if (nodes.getUnchecked (i)->nodeId == nodeId)
+            return nodes.getUnchecked (i);
+
+    return nullptr;
+}
+
+Processor* GraphNode::addNode (Processor* newNode, uint32 nodeId, bool deferPrepare)
+{
+    if (newNode == nullptr || (void*) newNode->getAudioProcessor() == (void*) this)
+    {
+        jassertfalse;
+        return nullptr;
+    }
+
+    for (int i = nodes.size(); --i >= 0;)
+    {
+        if (nodes.getUnchecked (i).get() == newNode)
+        {
+            jassertfalse; // Cannot add the same object to the graph twice!
+            return nullptr;
+        }
+    }
+
+    if (nodeId == 0 || nodeId == EL_INVALID_NODE)
+    {
+        const_cast<uint32&> (newNode->nodeId) = ++lastNodeId;
+        jassert (newNode->nodeId == lastNodeId);
+    }
+    else
+    {
+        if (nullptr != getNodeForId (nodeId))
+        {
+            // you can't add a node with an id that already exists in the graph..
+            jassertfalse;
+            removeNode (nodeId);
+        }
+
+        const_cast<uint32&> (newNode->nodeId) = nodeId;
+        jassert (newNode->nodeId == nodeId);
+        if (nodeId > lastNodeId)
+            lastNodeId = nodeId;
+    }
+
+    // Register the node before configuring it. setParentGraph() may synchronously
+    // adjust the parent graph's port count (for IO nodes), which re-enters
+    // IONodeEnforcer. That enforcer scans this same nodes array to decide which IO
+    // nodes are missing, so the node must already be present here or it gets added
+    // a second time (duplicate Audio In/Out). Keeping the port setup synchronous
+    // also ensures refreshPorts()/prepare() below see the final port count, so the
+    // node's RMS meter buffers are sized correctly.
+    auto* const added = nodes.add (newNode);
+    newNode->setPlayHead (playhead);
+    newNode->setParentGraph (this);
+    newNode->refreshPorts();
+    if (! deferPrepare && prepared())
+        newNode->prepare (getSampleRate(), getBlockSize(), this);
+    triggerAsyncUpdate();
+    return added;
+}
+
+bool GraphNode::removeNode (const uint32 nodeId)
+{
+    Array<uint32> nodeIds;
+    nodeIds.add (nodeId);
+    return removeNodes (nodeIds);
+}
+
+bool GraphNode::removeNodes (const Array<uint32>& nodeIds)
+{
+    ReferenceCountedArray<Processor> removed;
+
+    for (const auto& nodeId : nodeIds)
+    {
+        disconnectNode (nodeId);
+        for (int i = nodes.size(); --i >= 0;)
+        {
+            ProcessorPtr n = nodes.getUnchecked (i);
+            if (n->nodeId != nodeId)
+                continue;
+            nodes.remove (i);
+            removed.add (n.get());
+            break;
+        }
+    }
+
+    if (removed.isEmpty())
+        return false;
+
+    // Rebuild synchronously before detaching: the current rendering ops hold
+    // raw pointers to the removed nodes, so they must stay alive and attached
+    // until the sequence no longer references them.
+    handleAsyncUpdate();
+
+    for (auto* n : removed)
+    {
+        n->setParentGraph (nullptr);
+        n->setPlayHead (nullptr);
+    }
+
+    return true;
+}
+
+const GraphNode::Connection*
+    GraphNode::getConnectionBetween (const uint32 sourceNode,
+                                     const uint32 sourcePort,
+                                     const uint32 destNode,
+                                     const uint32 destPort) const
+{
+    const Connection c (sourceNode, sourcePort, destNode, destPort);
+    ArcSorter sorter;
+    return connections[connections.indexOfSorted (sorter, &c)];
+}
+
+bool GraphNode::isConnected (const uint32 sourceNode,
+                             const uint32 destNode) const
+{
+    for (int i = connections.size(); --i >= 0;)
+    {
+        const Connection* const c = connections.getUnchecked (i);
+
+        if (c->sourceNode == sourceNode
+            && c->destNode == destNode)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool GraphNode::canConnect (const uint32 sourceNode, const uint32 sourcePort, const uint32 destNode, const uint32 destPort) const
+{
+    if (sourceNode == destNode)
+    {
+        DBG ("[element] cannot connect to self: " << (int) sourceNode);
+        return false;
+    }
+
+    const Processor* const source = getNodeForId (sourceNode);
+    if (source == nullptr)
+    {
+        DBG ("[element] source not found");
+        return false;
+    }
+
+    if (sourcePort >= source->getNumPorts())
+    {
+        DBG ("[element] source port greater than total: port: "
+             << source->getName() << ": "
+             << (int) sourcePort << " total: "
+             << (int) source->getNumPorts());
+        return false;
+    }
+
+    if (! source->isPortOutput (sourcePort))
+    {
+        DBG ("[element] source port is not an output port: " << (int) sourcePort);
+        return false;
+    }
+
+    const Processor* const dest = getNodeForId (destNode);
+
+    if (dest == nullptr
+        || (destPort >= dest->getNumPorts())
+        || (! dest->isPortInput (destPort)))
+    {
+        return false;
+    }
+
+    const PortType sourceType (source->getPortType (sourcePort));
+    const PortType destType (dest->getPortType (destPort));
+
+    if (! sourceType.canConnect (destType))
+        return false;
+
+    // Graph Builder on understands one-to-one for these configs.
+    // - Any to Control
+    // - Control to CV
+    // clang-format off
+    if (destType == PortType::Control || 
+        (sourceType == PortType::Control && destType == PortType::CV))
+    {
+        int numSources = 0;
+        for (const auto* c : connections)
+            if (c->destNode == destNode && c->destPort == destPort)
+                if (++numSources > 0)
+                    return false;
+    }
+    // clang-format on
+
+    return getConnectionBetween (sourceNode, sourcePort, destNode, destPort) == nullptr;
+}
+
+bool GraphNode::addConnection (const uint32 sourceNode, const uint32 sourcePort, const uint32 destNode, const uint32 destPort)
+{
+    if (! canConnect (sourceNode, sourcePort, destNode, destPort))
+        return false;
+
+    ArcSorter sorter;
+    Connection* c = new Connection (sourceNode, sourcePort, destNode, destPort);
+    connections.addSorted (sorter, c);
+    triggerAsyncUpdate();
+    return true;
+}
+
+bool GraphNode::connectChannels (PortType type, uint32 sourceNode, int32 sourceChannel, uint32 destNode, int32 destChannel)
+{
+    Processor* src = getNodeForId (sourceNode);
+    Processor* dst = getNodeForId (destNode);
+    if (! src && ! dst)
+        return false;
+    return addConnection (src->nodeId, src->getPortForChannel (type, sourceChannel, false), dst->nodeId, dst->getPortForChannel (type, destChannel, true));
+}
+
+void GraphNode::removeConnection (const int index)
+{
+    connections.remove (index);
+    cancelPendingUpdate();
+    triggerAsyncUpdate();
+}
+
+bool GraphNode::removeConnection (const uint32 sourceNode, const uint32 sourcePort, const uint32 destNode, const uint32 destPort)
+{
+    bool doneAnything = false;
+
+    for (int i = connections.size(); --i >= 0;)
+    {
+        const Connection* const c = connections.getUnchecked (i);
+
+        if (c->sourceNode == sourceNode
+            && c->destNode == destNode
+            && c->sourcePort == sourcePort
+            && c->destPort == destPort)
+        {
+            removeConnection (i);
+            doneAnything = true;
+        }
+    }
+
+    return doneAnything;
+}
+
+bool GraphNode::disconnectNode (const uint32 nodeId)
+{
+    bool doneAnything = false;
+
+    for (int i = connections.size(); --i >= 0;)
+    {
+        const Connection* const c = connections.getUnchecked (i);
+
+        if (c->sourceNode == nodeId || c->destNode == nodeId)
+        {
+            removeConnection (i);
+            doneAnything = true;
+        }
+    }
+
+    return doneAnything;
+}
+
+bool GraphNode::isConnectionLegal (const Connection* const c) const
+{
+    jassert (c != nullptr);
+
+    const Processor* const source = getNodeForId (c->sourceNode);
+    const Processor* const dest = getNodeForId (c->destNode);
+
+    return source != nullptr && dest != nullptr
+           && source->isPortOutput (c->sourcePort) && dest->isPortInput (c->destPort)
+           && source->getPortType (c->sourcePort).canConnect (dest->getPortType (c->destPort))
+           && c->sourcePort < source->getNumPorts()
+           && c->destPort < dest->getNumPorts();
+}
+
+bool GraphNode::removeIllegalConnections()
+{
+    bool doneAnything = false;
+
+    for (int i = connections.size(); --i >= 0;)
+    {
+        if (! isConnectionLegal (connections.getUnchecked (i)))
+        {
+            removeConnection (i);
+            doneAnything = true;
+        }
+    }
+
+    return doneAnything;
+}
+
+void GraphNode::setMidiChannel (const int channel) noexcept
+{
+    jassert (isPositiveAndBelow (channel, 17));
+    if (channel <= 0)
+        midiChannels.setOmni (true);
+    else
+        midiChannels.setChannel (channel);
+}
+
+void GraphNode::setMidiChannels (const BigInteger channels) noexcept
+{
+    ScopedLock sl (getPropertyLock());
+    midiChannels.setChannels (channels);
+}
+
+void GraphNode::setMidiChannels (const MidiChannels channels) noexcept
+{
+    ScopedLock sl (getPropertyLock());
+    midiChannels = channels;
+}
+
+bool GraphNode::acceptsMidiChannel (const int channel) const noexcept
+{
+    ScopedLock sl (getPropertyLock());
+    return midiChannels.isOn (channel);
+}
+
+void GraphNode::setVelocityCurveMode (const VelocityCurve::Mode mode) noexcept
+{
+    ScopedLock sl (getPropertyLock());
+    velocityCurve.setMode (mode);
+}
+
+static void deleteRenderOpArray (Array<void*>& ops)
+{
+    for (int i = ops.size(); --i >= 0;)
+        delete static_cast<GraphOp*> (ops.getUnchecked (i));
+    ops.clearQuick();
+}
+
+void GraphNode::clearRenderingSequence()
+{
+    Array<void*> oldOps;
+    ReferenceCountedArray<Processor> oldNodes;
+
+    {
+        const ScopedLock sl (seqLock);
+        for (auto* recorder : recorders) recorder->graphChanged();
+        recorders.clear();
+        songManager=nullptr;
+        renderingOps.swapWith (oldOps);
+        renderNodes.swapWith(oldNodes);
+    }
+
+    deleteRenderOpArray (oldOps);
+}
+
+bool GraphNode::isAnInputTo (const uint32 possibleInputId,
+                             const uint32 possibleDestinationId,
+                             const int recursionCheck) const
+{
+    if (recursionCheck > 0)
+    {
+        for (int i = connections.size(); --i >= 0;)
+        {
+            const GraphNode::Connection* const c = connections.getUnchecked (i);
+
+            if (c->destNode == possibleDestinationId
+                && (c->sourceNode == possibleInputId
+                    || isAnInputTo (possibleInputId, c->sourceNode, recursionCheck - 1)))
+                return true;
+        }
+    }
+
+    return false;
+}
+
+void GraphNode::buildRenderingSequence()
+{
+    EL_LOAD_TRACE (String ("buildRenderingSequence: ") + getName());
+    EL_LOAD_TRACE_COUNT ("buildRenderingSequence");
+    Array<void*> newRenderingOps;
+    int numRenderingBuffersNeeded = 2;
+    int numMidiBuffersNeeded = 1;
+    int numAtomBuffersNeeded = 1;
+
+    {
+        Array<void*> orderedNodes;
+
+        {
+            const LookupTable table (connections);
+
+            for (int i = 0; i < nodes.size(); ++i)
+            {
+                Processor* const node = nodes.getUnchecked (i);
+
+                int j = 0;
+                for (; j < orderedNodes.size(); ++j)
+                    if (table.isAnInputTo (node->nodeId, ((Processor*) orderedNodes.getUnchecked (j))->nodeId))
+                        break;
+
+                orderedNodes.insert (j, node);
+            }
+        }
+
+        GraphBuilder builder (*this, orderedNodes, newRenderingOps);
+        numRenderingBuffersNeeded = builder.buffersNeeded (PortType::Audio);
+        numMidiBuffersNeeded = builder.buffersNeeded (PortType::Midi);
+        numAtomBuffersNeeded = builder.buffersNeeded (PortType::Atom);
+        setLatencySamples (builder.getTotalLatencySamples());
+    }
+
+    // Snapshot membership off audio. Publish with the matching rendering ops;
+    // the old references are released on this thread after the lock is dropped.
+    ReferenceCountedArray<Processor> nextNodes(nodes);
+    // Allocate the new scratch storage before excluding the audio callback.
+    AudioSampleBuffer nextBuffers (numRenderingBuffersNeeded, jmax (4096, getBlockSize()));
+    nextBuffers.clear();
+    OwnedArray<MidiBuffer> nextMidi;
+    for (int i = 0; i < numMidiBuffersNeeded; ++i) {
+        auto* buffer = nextMidi.add (new MidiBuffer());
+        buffer->ensureSize (65536);
+    }
+    {
+        const ScopedLock property (getPropertyLock());
+        const ScopedLock sequence (seqLock);
+        for (auto* next : newRenderingOps)
+            for (auto* previous : renderingOps)
+                if (static_cast<GraphOp*> (next)->takeHistoryFrom (*static_cast<GraphOp*> (previous)))
+                    break;
+        std::swap (renderingBuffers, nextBuffers);
+        midiBuffers.swapWith (nextMidi);
+        for (auto* recorder : recorders) recorder->graphChanged();
+        recorders.clear();
+        songManager=nullptr;
+        for (auto* n : nodes) if (auto* recorder = dynamic_cast<RecorderNode*>(n)) recorders.push_back(recorder);
+        // Bind managers only while rendering is excluded. MIDI arcs also enforce
+        // manager-before-looper scheduling; references remain owned off audio thread.
+        for (auto* n : nodes)
+            if (auto* p = dynamic_cast<LooperProcessor*> (n->getAudioProcessor())) {
+                p->managerOwner.store (0);
+                p->managerSoloMuted.store(false);
+                p->managerCaptureGate.reset();
+                p->managerSelected.store (false);
+            }
+        for (auto* n : nodes)
+            if (auto* manager = dynamic_cast<LooperManagerNode*> (n)) {
+                manager->configure (*this);
+                // Internal addressed commands are larger than incoming CCs.
+                // Reserve graph buffers off the audio thread before swapping them.
+                // MIDI storage was reserved before acquiring render locks.
+            }
+        songManager = nullptr;
+        for (auto* n : nodes) if (auto* manager=dynamic_cast<SongManagerNode*>(n)) {
+            manager->effective.store(false);
+            if (!songManager) { songManager=manager;manager->effective.store(true);manager->configure(*this); }
+        }
+        for (auto* n : nodes) if (auto* graph=dynamic_cast<GraphNode*>(n)) {
+            if(!songManager || std::find(songManager->orderIDs().begin(),songManager->orderIDs().end(),n->nodeId)==songManager->orderIDs().end())
+                graph->clearSongGate();
+        }
+        renderingOps.swapWith (newRenderingOps);
+        renderNodes.swapWith(nextNodes);
+    }
+
+    // delete the old ones..
+    deleteRenderOpArray (newRenderingOps);
+
+    renderingSequenceChanged();
+}
+
+void GraphNode::getOrderedNodes (ReferenceCountedArray<Processor>& orderedNodes)
+{
+    const LookupTable table (connections);
+    for (int i = 0; i < nodes.size(); ++i)
+    {
+        Processor* const node = nodes.getUnchecked (i);
+
+        int j = 0;
+        for (; j < orderedNodes.size(); ++j)
+            if (table.isAnInputTo (node->nodeId, ((Processor*) orderedNodes.getUnchecked (j))->nodeId))
+                break;
+
+        orderedNodes.insert (j, node);
+    }
+}
+
+void GraphNode::handleAsyncUpdate()
+{
+    buildRenderingSequence();
+}
+
+void GraphNode::prepareToRender (double sampleRate, int estimatedSamplesPerBlock)
+{
+    songMidi.ensureSize(65536);
+    const bool paramsChanged = (getSampleRate() != sampleRate || getBlockSize() != estimatedSamplesPerBlock);
+
+    if (prepared() && ! paramsChanged)
+        return;
+
+    if (prepared() && paramsChanged)
+    {
+        releaseResources();
+    }
+
+    currentAudioInputBuffer = nullptr;
+    currentAudioOutputBuffer.setSize (jmax (1, jmax (getNumAudioInputs(), getNumAudioOutputs())), jmax (4096, estimatedSamplesPerBlock));
+    currentMidiInputBuffer = nullptr;
+    currentMidiOutputBuffer.ensureSize (65536);
+    filteredMidi.ensureSize (65536);
+    currentMidiOutputBuffer.clear();
+    clearRenderingSequence();
+
+    _prepared = true;
+    if (paramsChanged)
+        setRenderDetails (sampleRate, estimatedSamplesPerBlock);
+
+    for (int i = 0; i < nodes.size(); ++i)
+        nodes.getUnchecked (i)->prepare (sampleRate, estimatedSamplesPerBlock, this);
+
+    buildRenderingSequence();
+}
+
+void GraphNode::releaseResources()
+{
+    if (! prepared())
+        return;
+
+    for (int i = 0; i < nodes.size(); ++i)
+        nodes.getUnchecked (i)->unprepare();
+
+    _prepared = false;
+
+    renderingBuffers.setSize (1, 1);
+    midiBuffers.clear();
+
+    currentAudioInputBuffer = nullptr;
+    currentAudioOutputBuffer.setSize (1, 1);
+    currentMidiInputBuffer = nullptr;
+    currentMidiOutputBuffer.clear();
+}
+
+void GraphNode::reset()
+{
+    const ScopedLock sl (getPropertyLock());
+    for (auto node : nodes)
+        if (auto* const proc = node->getAudioProcessor())
+            proc->reset();
+}
+
+void GraphNode::captureForRecorders (Processor& node, const AudioBuffer<float>& audio,
+                                    int channels, float gainStart, float gainEnd, bool processed) noexcept
+{
+    for (auto* recorder : recorders) recorder->captureNode(node,audio,channels,gainStart,gainEnd,processed);
+}
+// MARK: Process Graph
+
+void GraphNode::clearSongGate() noexcept {
+    const ScopedLock sequence(seqLock);
+    songGate={};songGain=1.0f;songControllers={};songNotes={};
+    for(auto* node:renderNodes)if(auto* child=dynamic_cast<GraphNode*>(node))child->clearSongGate();
+}
+
+int GraphNode::songPanicOffset() const noexcept {
+    return publishedSongPanic.load();
+}
+
+void GraphNode::render (RenderContext& rc)
+{
+    const ScopedLock songSequenceLock(seqLock);
+    const int32 numSamples = rc.audio.getNumSamples();
+    auto& midiMessages = *rc.midi.getWriteBuffer (0);
+    if(globalSongStop>=0)
+        for(auto* node:renderNodes) if(auto* manager=dynamic_cast<SongManagerNode*>(node)) manager->stopForPanic();
+    if (songManager) {
+        songManager->plan(midiMessages,numSamples);
+        if(songManager->panicOffset()>=0) globalSongStop=songManager->panicOffset();
+    }
+    if(globalSongStop>=0) {
+        for(int ch=1;ch<=16;++ch) {
+            BoundedMidi::add(midiMessages,MidiMessage::allNotesOff(ch),globalSongStop);
+            BoundedMidi::add(midiMessages,MidiMessage::controllerEvent(ch,64,0),globalSongStop);
+        }
+        for(auto* n:renderNodes) {
+            if(auto* p=dynamic_cast<LooperProcessor*>(n->getAudioProcessor())) p->scheduleSectionEvent(globalSongStop,false);
+            if(auto* manager=dynamic_cast<LooperManagerNode*>(n)) manager->cancelPendingForSection(globalSongStop,false);
+            if(auto* manager=dynamic_cast<SongManagerNode*>(n)) manager->stopForPanic();
+            if(auto* graph=dynamic_cast<GraphNode*>(n))graph->scheduleSongStop(globalSongStop);
+        }
+        globalSongStop=-1;
+    }
+    if (songGate.enabled) {
+        const auto activeAt=[&](int at) { return songGate.transition>=0 && at>=songGate.transition ? songGate.after : songGate.before; };
+        // Keep processors prepared and advancing, but inactive sections receive no
+        // live input or new MIDI. Orphan releases cannot trigger short gestures.
+        float predictedGain=songGain;
+        const float gateStep=float(1.0/std::max(1.0,getSampleRate()*0.005));
+        for(int at=0;at<numSamples;++at) {
+            const bool active=activeAt(at);
+            predictedGain=active?std::min(1.0f,predictedGain+gateStep):std::max(0.0f,predictedGain-gateStep);
+            // Keep the old live branch fed only through its short output fade.
+            if(!active&&predictedGain<=0)
+                for(int ch=0;ch<rc.audio.getNumChannels();++ch)rc.audio.setSample(ch,at,0);
+        }
+        songMidi.clear();
+        const int silence=songGate.stop<0?songGate.panic:songGate.panic<0?songGate.stop:std::min(songGate.stop,songGate.panic);
+        bool resetHeld=false;
+        if(silence>=0) for(int ch=0;ch<16;++ch) {
+            BoundedMidi::add(songMidi,MidiMessage::allNotesOff(ch+1),silence);
+            BoundedMidi::add(songMidi,MidiMessage::controllerEvent(ch+1,64,0),silence);
+            if(songGate.panic>silence) {
+                BoundedMidi::add(songMidi,MidiMessage::allNotesOff(ch+1),songGate.panic);
+                BoundedMidi::add(songMidi,MidiMessage::controllerEvent(ch+1,64,0),songGate.panic);
+            }
+        }
+        for(const auto metadata:midiMessages) {
+            const int at=metadata.samplePosition;
+            if(silence>=0 && at>=silence && !resetHeld) {songControllers={};songNotes={};resetHeld=true;}
+            if(!activeAt(at))continue;
+            if (metadata.numBytes > 3) {
+                BoundedMidi::add(songMidi,metadata.data,metadata.numBytes,at);
+                continue;
+            }
+            const auto msg=metadata.getMessage();
+            const int ch=msg.getChannel()-1;
+            if(ch>=0&&ch<16&&msg.isController()) {
+                auto& down=songControllers[size_t(ch)][size_t(msg.getControllerNumber())];
+                if(msg.getControllerValue()==0&&!down) {
+                    bool gesture=false;
+                    for(auto* node:renderNodes) if(auto* looper=dynamic_cast<LooperProcessor*>(node->getAudioProcessor()))
+                        for(int action=0;action<LooperProcessor::midiActions;++action) {
+                            const auto mapping=looper->getMidiMapping(action);
+                            gesture|=mapping.cc==msg.getControllerNumber()&&(mapping.channel==0||mapping.channel==msg.getChannel());
+                        }
+                    if(gesture)continue;
+                }
+                down=msg.getControllerValue()>0;
+            }
+            if(ch>=0&&ch<16&&msg.isNoteOnOrOff()) {
+                auto& down=songNotes[size_t(ch)][size_t(msg.getNoteNumber())];
+                if(msg.isNoteOff()&&!down)continue;
+                down=msg.isNoteOn();
+            }
+            BoundedMidi::add(songMidi,msg,at);
+        }
+        if(silence>=0) {
+            // Sustain and hanging synth notes are cancelled, never synthesize CC
+            // pedal releases (which could execute Undo or Next).
+            if(!resetHeld) {songControllers={};songNotes={};}
+        }
+        midiMessages.swapWith(songMidi);
+        for(auto* n:renderNodes) {
+            if(auto* looper=dynamic_cast<LooperProcessor*>(n->getAudioProcessor())) {
+                if(songGate.stop>=0)looper->scheduleSectionEvent(songGate.stop,false);
+                if(songGate.start>=0)looper->scheduleSectionEvent(songGate.start,true);
+                if(songGate.panic>=0)looper->scheduleSectionEvent(songGate.panic,false);
+            }
+            if(auto* manager=dynamic_cast<LooperManagerNode*>(n)) {
+                if(songGate.stop>=0)manager->cancelPendingForSection(songGate.stop,false);
+                if(songGate.start>=0)manager->cancelPendingForSection(songGate.start,true);
+                if(songGate.panic>=0)manager->cancelPendingForSection(songGate.panic,false);
+            }
+            // Nested containers inherit section control; their parent already
+            // gates audio/MIDI, so only propagate capture/playback commands.
+            if(auto* graph=dynamic_cast<GraphNode*>(n)) {
+                auto inherited=songGate; inherited.before=inherited.after=true;
+                graph->setSongGate(inherited);
+            }
+        }
+    }
+    currentAudioInputBuffer = &rc.audio;
+    currentAudioOutputBuffer.setSize (jmax (1, rc.audio.getNumChannels()), numSamples, false, false, true);
+    currentAudioOutputBuffer.clear();
+
+    const bool applyVelocityCurve = (velocityCurve.getMode() != VelocityCurve::Linear);
+
+    if (midiChannels.isOmni() && ! applyVelocityCurve)
+    {
+        currentMidiInputBuffer = &midiMessages;
+    }
+    else
+    {
+        filteredMidi.clear();
+        int chan = 0;
+
+        for (auto m : midiMessages)
+        {
+            if(m.numBytes>3){BoundedMidi::add(filteredMidi,m.data,m.numBytes,m.samplePosition);continue;}
+            auto msg = m.getMessage();
+            chan = msg.getChannel();
+            if (chan > 0 && midiChannels.isOff (chan))
+                continue;
+
+            if (applyVelocityCurve && msg.isNoteOn())
+            {
+                msg.setVelocity (velocityCurve.process (msg.getFloatVelocity()));
+            }
+
+            BoundedMidi::add(filteredMidi,msg, m.samplePosition);
+        }
+
+        currentMidiInputBuffer = &filteredMidi;
+    }
+
+    currentMidiOutputBuffer.clear();
+
+    {
+        ScopedLock sl (seqLock);
+        for (auto* recorder : recorders) recorder->beginBlock(numSamples);
+        for (auto ptr : renderingOps)
+        {
+            GraphOp* const op = static_cast<GraphOp*> (ptr);
+            op->perform (renderingBuffers, midiBuffers, numSamples);
+        }
+        for (auto* recorder : recorders) recorder->endBlock();
+    }
+
+    for (int i = 0; i < rc.audio.getNumChannels(); ++i)
+        rc.audio.copyFrom (i, 0, currentAudioOutputBuffer, i, 0, numSamples);
+
+    if(songGate.enabled) {
+        const float increment=float(1.0/std::max(1.0,getSampleRate()*0.005));
+        for(int at=0;at<numSamples;++at) {
+            const bool active=songGate.transition>=0&&at>=songGate.transition?songGate.after:songGate.before;
+            songGain=active?std::min(1.0f,songGain+increment):std::max(0.0f,songGain-increment);
+            for(int ch=0;ch<rc.audio.getNumChannels();++ch)rc.audio.setSample(ch,at,rc.audio.getSample(ch,at)*songGain);
+        }
+    }
+    int panicOffset=songManager?songManager->panicOffset():-1;
+    for(auto* n:renderNodes) if(auto* graph=dynamic_cast<GraphNode*>(n)) {
+        const int child=graph->songPanicOffset();
+        if(child>=0)panicOffset=panicOffset<0?child:std::min(panicOffset,child);
+    }
+    if(panicOffset>=0) {
+        if(panicOffset<numSamples)for(int ch=0;ch<rc.audio.getNumChannels();++ch)rc.audio.clear(ch,panicOffset,numSamples-panicOffset);
+        globalSongStop=0; // Descendant panic also stops shared ancestors next block.
+    }
+    publishedSongPanic.store(panicOffset);
+    midiMessages.clear();
+    BoundedMidi::append(midiMessages,currentMidiOutputBuffer, 0, numSamples, 0);
+}
+
+void GraphNode::getPluginDescription (PluginDescription& d) const
+{
+    d.name = getName();
+    d.uniqueId = d.name.hashCode();
+    d.category = "Graphs";
+    d.pluginFormatName = EL_NODE_FORMAT_NAME;
+    d.fileOrIdentifier = EL_NODE_ID_GRAPH;
+    d.manufacturerName = EL_NODE_FORMAT_AUTHOR;
+    d.version = "1.0.0";
+    d.isInstrument = false;
+    d.numInputChannels = getNumAudioInputs();
+    d.numOutputChannels = getNumAudioOutputs();
+}
+
+void GraphNode::setPlayHead (AudioPlayHead* newPlayHead)
+{
+    Processor::setPlayHead (newPlayHead);
+    playhead = getPlayHead();
+    for (auto* const node : nodes)
+        node->setPlayHead (playhead);
+}
+
+void GraphNode::refreshPorts()
+{
+    if (! customPortsSet)
+    {
+        auto count = PortCount().with (PortType::Audio, 2, 2).with (PortType::Midi, 1, 1);
+        setPorts (count.toPortList());
+    }
+    else
+    {
+        setPorts (userPorts);
+    }
+
+    for (auto* node : nodes)
+    {
+        if (auto io = dynamic_cast<IONode*> (node))
+            io->refreshPorts();
+    }
+}
+
+void GraphNode::setNumPorts (PortType type, int count, bool inputs, bool async)
+{
+    if (type != PortType::Audio && type != PortType::Midi)
+        return;
+
+    count = std::max ((int) 0, count);
+    PortCount newCount;
+    for (int ti = 0; ti < PortType::Unknown; ++ti)
+    {
+        auto tp = PortType (ti);
+        newCount.set (tp,
+                      (inputs && type == tp) ? count : getNumPorts (tp, true),
+                      (! inputs && type == tp) ? count : getNumPorts (tp, false));
+    }
+
+    userPorts = newCount.toPortList();
+    customPortsSet = true;
+
+    if (async)
+        triggerPortReset();
+    else
+    {
+        resetPorts();
+        portsChanged();
+    }
+}
+
+void GraphNode::rebuild() noexcept
+{
+    cancelPendingUpdate();
+    handleAsyncUpdate();
+}
+
+} // namespace element

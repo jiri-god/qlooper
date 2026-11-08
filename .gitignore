@@ -1,0 +1,9 @@
+build*/
+dist/
+stage/
+.DS_Store
+*.dmg
+*.zip
+*.tar.gz
+*.autosave
+__pycache__/

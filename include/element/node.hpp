@@ -1,0 +1,654 @@
+// Copyright 2023 Kushview, LLC <info@kushview.net>
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#pragma once
+
+#include <element/element.h>
+#include <element/node.h>
+
+#include <element/arc.hpp>
+#include <element/model.hpp>
+#include <element/midichannels.hpp>
+#include <element/processor.hpp>
+#include <element/tags.hpp>
+
+#define EL_NODE_VERSION  1
+#define EL_PORT_VERSION  1
+#define EL_GRAPH_VERSION 1
+
+namespace element {
+
+class DataPath;
+class GraphManager;
+class NodeArray;
+class PortArray;
+class Node;
+class Script;
+
+/** Representation of a Port of a Node. */
+class EL_API Port : public Model {
+public:
+    Port() : Model (types::Port, EL_PORT_VERSION) {}
+    Port (const juce::ValueTree& p)
+        : Model (p) { jassert (p.hasType (types::Port)); }
+    Port (const juce::String& name, const juce::Identifier& type, const juce::Identifier& flow, uint32 index = 0)
+        : Model (types::Port, EL_PORT_VERSION)
+    {
+        objectData.setProperty (tags::name, name, nullptr)
+            .setProperty (tags::index, static_cast<int> (index), nullptr)
+            .setProperty (tags::type, type.toString(), nullptr)
+            .setProperty (tags::flow, flow.toString(), nullptr);
+    }
+
+    ~Port() {}
+
+    /** Returns the ValueTree of the Node containing this port
+        will not always be valid 
+     */
+    inline juce::ValueTree getNodeValueTree() const { return objectData.getParent().getParent(); }
+
+    /** Returns the Node containing this port */
+    Node getNode() const;
+
+    /** Returns true if this port probably lives on a Node */
+    inline bool hasParentNode() const { return getNodeValueTree().hasType (types::Node); }
+
+    const bool isInput() const
+    {
+        jassert (objectData.hasProperty ("flow"));
+        return getProperty ("flow", "").toString() == "input";
+    }
+
+    const bool isOutput() const
+    {
+        jassert (objectData.hasProperty ("flow"));
+        return getProperty ("flow", "").toString() == "output";
+    }
+
+    /** Returns the port name. */
+    const juce::String getName() const { return getProperty (tags::name, "Port"); }
+
+    /** Returns the type of this Port. */
+    const PortType getType() const { return PortType (getProperty (tags::type, "unknown").toString()); }
+
+    bool isA (const PortType type, const bool isInputFlow) const { return getType() == type && isInputFlow == isInput(); }
+
+    /** Returns the port index of this Port. */
+    uint32 index() const noexcept;
+
+    /** Returns the symbol for this Port. */
+    const juce::String symbol() const noexcept;
+
+    /** Returns the coresponding channel for this port's index */
+    int channel() const noexcept;
+
+    /** Change block visibility. */
+    void setHiddenOnBlock (bool visible);
+
+    /** Returns true if should be hidden on block. */
+    bool isHiddenOnBlock() const;
+};
+
+/** Representation of a Node */
+class EL_API Node : public Model {
+public:
+    /** Create an invalid node */
+    Node();
+
+    /** Create a node with existing data */
+    Node (const juce::ValueTree& data, const bool setMissing = true);
+
+    /** Creates a node with specific type */
+    Node (const juce::Identifier& nodeType);
+
+    /** Destructor */
+    ~Node() noexcept;
+
+    //=========================================================================
+    /** Returns true if the underlying data is probably a node */
+    bool isValid() const noexcept;
+
+    /** Returns the user-modifiable name of this node */
+    const juce::String getName() const noexcept;
+
+    /** Change the user-defined name */
+    void setName (const juce::String& name);
+
+    /** Returns the node name defined by the user. If not set it returns the
+        node name set when loaded.
+    */
+    const juce::String getDisplayName() const noexcept;
+
+    /** Returns the name as defined by the loaded plugin */
+    const juce::String getPluginName() const noexcept;
+
+    /** Returns true if the name has been user-modified */
+    bool hasModifiedName() const noexcept;
+
+    //=========================================================================
+    /** Returns the nodeId as defined in the engine */
+    const uint32_t getNodeId() const { return (uint32_t) (juce::int64) getProperty (tags::id); }
+
+    /** Returns this Node's UUID as a string */
+    juce::String getUuidString() const { return objectData.getProperty (tags::uuid).toString(); }
+
+    /** Returns this Node's UUID */
+    juce::Uuid getUuid() const { return juce::Uuid (getUuidString()); }
+
+    //=========================================================================
+    /** Returns true if this node is probably a graph */
+    bool isGraph() const { return isProbablyGraphNode (objectData); }
+
+    /** Returns true if this is a root graph on the session */
+    bool isRootGraph() const
+    {
+        return objectData.getParent().hasType (tags::graphs) && objectData.getParent().getParent().hasType (types::Session);
+    }
+
+    /** Returns an Identifier indicating this nodes type */
+    const Identifier getNodeType() const
+    {
+        auto type = getProperty (tags::type).toString();
+        return type.isNotEmpty() ? type : Identifier ("unknown");
+    }
+
+    /** Returns true if this node is a specific type */
+    const bool hasNodeType (const Identifier& t) const { return getNodeType() == t; }
+
+    /** Returns true if this node is of the given format and unique ID */
+    bool isA (const String& format, const String& identifier) const;
+
+    //=========================================================================
+    /** Returns true if this node has a custom editor */
+    bool hasEditor() const;
+
+    //=========================================================================
+    /** Returns the graph containing this node, if any */
+    Node getParentGraph() const;
+
+    /** Returns true if descendent of */
+    bool descendsFrom (const Node& graph) const;
+
+    /** Returns true if this is a direct child of a root level graph */
+    bool isChildOfRootGraph() const;
+
+    //=========================================================================
+    /** Returns true if this node couldn't be loaded but still remains on it's
+        parenet graph */
+    bool isMissing() const { return hasProperty (tags::missing); }
+
+    /** Returns true if this node should be enabled */
+    inline const bool isEnabled() const { return (bool) getProperty (tags::enabled, true); }
+
+    //=========================================================================
+    /** Returns the enabled MIDI channels on this Node */
+    MidiChannels getMidiChannels() const;
+
+    //=========================================================================
+    /** Returns true if bypass is on for this Node */
+    bool isBypassed() const { return objectData.getProperty (tags::bypass, false); }
+
+    /** Returns the Value object for the bypass property */
+    juce::Value getBypassedValue() { return getPropertyAsValue (tags::bypass); }
+
+    //=========================================================================
+    /** Returns true if this Node is muted */
+    bool isMuted() const { return (bool) getProperty (tags::mute, false); }
+
+    /** Returns the Value object for the mute property */
+    juce::Value getMutedValue() { return getPropertyAsValue (tags::mute); }
+
+    /** Returns true if inputs are muted */
+    bool isMutingInputs() const { return (bool) getProperty (tags::muteInput, false); }
+
+    /** Change the mute status of this Node */
+    void setMuted (bool);
+
+    /** Change the mute status of inputs on this Node */
+    void setMuteInput (bool);
+
+    //=========================================================================
+    /** Returns the number of connections on this node */
+    int getNumConnections() const;
+
+    /** Returns a Value tree containing connection information */
+    juce::ValueTree getConnectionValueTree (const int index) const;
+
+    /** Get an array of Arcs contained on this Node (graph) */
+    void getArcs (juce::OwnedArray<Arc>&) const;
+
+    //=========================================================================
+    /** Set relative position */
+    void setRelativePosition (const double x, const double y);
+
+    /** Gets the x/y relative coordinates of this node */
+    void getRelativePosition (double& x, double& y) const;
+
+    /** Returns true if properties "x" and "y" are present */
+    bool hasPosition() const;
+
+    /** Gets the x/y coordinates of this node in the editor */
+    void getPosition (double& x, double& y) const;
+
+    /** Set the x/y position of this node in the editor */
+    void setPosition (double x, double y);
+
+    //=========================================================================
+    /** Returns the engine-side graphnode implementation */
+    Processor* getObject() const;
+
+    /** Returns a child graph node object by id */
+    Processor* getObjectForId (const uint32) const;
+
+    /** Returns true if this node can connect to another in any capacity */
+    const bool canConnectTo (const Node& o) const;
+
+    //=========================================================================
+    /** Returns the number of child nodes contained on this node */
+    int getNumNodes() const { return getNodesValueTree().getNumChildren(); }
+
+    /** Returns a child node by index */
+    Node getNode (const int index) const { return Node (getNodesValueTree().getChild (index), false); }
+
+    const int getNumAudioIns() const { return (int) getProperty ("numAudioIns", 0); }
+    const int getNumAudioOuts() const { return (int) getProperty ("numAudioOuts", 0); }
+
+    int getNumPorts() const { return getPortsValueTree().getNumChildren(); }
+    void getPorts (PortArray& ports, PortType type, bool isInput) const;
+    void getPorts (PortArray& ins, PortArray& outs, PortType type) const;
+    void getAudioInputs (PortArray& ports) const;
+    void getAudioOutputs (PortArray& ports) const;
+
+    //==========================================================================
+    bool isAudioIONode() const;
+    bool isAudioInputNode() const;
+    bool isAudioOutputNode() const;
+    bool isMidiIONode() const;
+
+    /** Returns true if a global MIDI input node. e.g */
+    bool isMidiInputNode() const;
+
+    /** Returns true if a global MIDI output node. e.g */
+    bool isMidiOutputNode() const;
+
+    /** Returns true if this node is an inlet or outlet */
+    inline bool isIONode() const { return isAudioIONode() || isMidiIONode(); }
+    /** Returns true if this node is an inlet or outlet */
+    inline bool isDuplex() const { return isAudioIONode() || isMidiIONode(); }
+
+    //==========================================================================
+    /** Returns true if this is a single MIDI input device (not global) */
+    bool isMidiInputDevice() const;
+
+    /** Returns true if this is a single MIDI output device (not global) */
+    bool isMidiOutputDevice() const;
+
+    /** Returns true if a MIDI in or out device */
+    bool isMidiDevice() { return isMidiInputDevice() || isMidiOutputDevice(); }
+
+    /** Returns the format of this node */
+    inline const juce::var& getFormat() const { return objectData.getProperty (tags::format); }
+
+    /** Returns this nodes identifier */
+    inline const juce::var& getIdentifier() const { return objectData.getProperty (tags::identifier); }
+
+    /** Returns a file property if exists, otherwise the identifier property */
+    inline const juce::var& getFileOrIdentifier() const
+    {
+        return objectData.hasProperty (tags::file)
+                   ? objectData.getProperty (tags::file)
+                   : getIdentifier();
+    }
+
+    /** returns the first node by format and identifier */
+    inline Node getNodeByFormat (const juce::var& format, const juce::var& identifier) const
+    {
+        auto nodes = getNodesValueTree();
+
+        for (int i = 0; i < nodes.getNumChildren(); ++i) {
+            auto child = nodes.getChild (i);
+            if (child[tags::format] == format && child[tags::identifier] == identifier)
+                return Node (child, false);
+        }
+
+        return Node();
+    }
+
+    Node getIONode (PortType portType, const bool isInput) const
+    {
+        if (! portType.isAudio() && ! portType.isMidi())
+            return Node();
+
+        String identifier = portType.getSlug();
+        identifier << "." << String ((isInput) ? "input" : "output");
+        return getNodeByFormat ("Internal", identifier);
+    }
+
+    bool hasChildNode (const juce::var& format, const juce::var& identifier) const
+    {
+        auto nodes = getNodesValueTree();
+        for (int i = 0; i < nodes.getNumChildren(); ++i) {
+            auto child = nodes.getChild (i);
+            if (child[tags::format] == format && child[tags::identifier] == identifier)
+                return true;
+        }
+        return false;
+    }
+
+    /** Returns true if this node contains an Audio Input node */
+    bool hasAudioInputNode() const { return hasChildNode ("Internal", "audio.input"); }
+
+    /** Returns true if this node contains an Audio Output node */
+    bool hasAudioOutputNode() const { return hasChildNode ("Internal", "audio.output"); }
+
+    /** Returns true if this node contains a MIDI Input node */
+    bool hasMidiInputNode() const { return hasChildNode ("Internal", "midi.input"); }
+
+    /** Returns true if this node contains a MIDI Output node */
+    bool hasMidiOutputNode() const { return hasChildNode ("Internal", "midi.output"); }
+
+    /** Fill a plugin Description for loading with the plugin manager */
+    void getPluginDescription (juce::PluginDescription&) const;
+
+    //=========================================================================
+    /** Write the contents of this node to file */
+    bool writeToFile (const juce::File& file) const;
+
+    /** Save this node as a preset to file */
+    bool savePresetTo (const DataPath& path, const juce::String& name) const;
+
+    /** Get an array of possible sources that can connect to this Node */
+    void getPossibleSources (NodeArray& nodes) const;
+
+    /** Get an array of possible destinations this node can connect to */
+    void getPossibleDestinations (NodeArray& nodes) const;
+
+    /** Returns a child node by Node ID */
+    Node getNodeById (const uint32 nodeId) const;
+
+    /** Returns a child node by UUID */
+    Node getNodeByUuid (const juce::Uuid& uuid, const bool recursive = true) const;
+
+    //=========================================================================
+    /** Rebuild this node's ports based on it's Processor object */
+    void resetPorts();
+
+    /** Get a port by index */
+    Port getPort (const int index) const;
+
+    /** Returns true if the passed in nodes and ports cann connect to one another */
+    bool canConnect (const uint32 sourceNode, const uint32 sourcePort, const uint32 destNode, const uint32 destPort) const;
+
+    //=========================================================================
+    /** Saves the node state from Processor to state property */
+    void savePluginState();
+
+    /** Reads state property and applies to Processor.
+        Recurses into child nodes; use restoreOwnPluginState() when children
+        are restored elsewhere.
+    */
+    void restorePluginState();
+
+    /** Reads state property and applies to Processor for this node only,
+        without recursing into child nodes.
+    */
+    void restoreOwnPluginState();
+
+    //=========================================================================
+    /** Get the number of factory presets */
+    int getNumPrograms() const;
+
+    /** Change a factory preset's name */
+    String getProgramName (const int index) const;
+
+    /** Load a factory preset */
+    void setCurrentProgram (const int index);
+
+    /** Get the currently loaded factory preset */
+    int getCurrentProgram() const;
+
+    //=========================================================================
+    /** True if global MIDI programs should be loaded/saved */
+    bool useGlobalMidiPrograms() const;
+
+    /** Change whether to load/save global programs */
+    void setUseGlobalMidiPrograms (bool);
+
+    /** True if MIDI program functionality is on */
+    bool areMidiProgramsEnabled() const;
+
+    /** Turn MIDI Programs on or off */
+    void setMidiProgramsEnabled (bool);
+
+    /** Returns the current MIDI program */
+    int getMidiProgram() const;
+
+    /** Sets the current midi program */
+    void setMidiProgram (int program);
+
+    /** Returns the name of a MIDI program */
+    String getMidiProgramName (int program) const;
+
+    /** Change a MIDI program's name */
+    void setMidiProgramName (int program, const String& name);
+
+    //=========================================================================
+    juce::ValueTree getArcsValueTree() const { return objectData.getChildWithName (tags::arcs); }
+    juce::ValueTree getNodesValueTree() const { return objectData.getChildWithName (tags::nodes); }
+    juce::ValueTree getParentArcsNode() const;
+    juce::ValueTree getPortsValueTree() const { return objectData.getChildWithName (tags::ports); }
+    juce::ValueTree getUIValueTree() const { return objectData.getChildWithName (tags::ui); }
+    juce::ValueTree getBlockValueTree() const noexcept { return getUIValueTree().getChildWithName (types::Block); }
+    juce::ValueTree getScriptsValueTree() const noexcept { return objectData.getChildWithName (tags::scripts); }
+
+    //=========================================================================
+    const bool operator== (const Node& o) const { return this->objectData == o.objectData; }
+    const bool operator!= (const Node& o) const { return this->objectData != o.objectData; }
+
+    /** Iterate over all ValueTree's recursively */
+    void forEach (std::function<void (const juce::ValueTree& tree)>) const;
+
+    /** Change the block color */
+    void setColor (const juce::Colour& color)
+    {
+        getUIValueTree().setProperty ("color", color.toString(), nullptr);
+    }
+
+    /** Returns the color of this node. */
+    juce::Colour getColor() const noexcept
+    {
+        return juce::Colour::fromString (getUIValueTree().getProperty ("color").toString());
+    }
+
+    /** Returns the color of this node or a fallback */
+    juce::Colour getColor (juce::Colour fallback) const noexcept
+    {
+        return getUIValueTree().hasProperty ("color") ? getColor() : fallback;
+    }
+
+    /** Change whether this node's strip is hidden in the graph mixer. */
+    void setHiddenInMixer (bool hidden)
+    {
+        getUIValueTree().setProperty (tags::hiddenInMixer, hidden, nullptr);
+    }
+
+    /** Returns true if this node's strip should be hidden in the graph mixer. */
+    bool isHiddenInMixer() const noexcept
+    {
+        return (bool) getUIValueTree().getProperty (tags::hiddenInMixer, false);
+    }
+
+    /** Add a script to this node.
+        If failure, the returned will be invalid;
+    */
+    juce::ValueTree addScript (const Script& script);
+
+    //==========================================================================
+    /** Returns true if the connection exists in the provided ValueTree
+
+        @param arcs          Value tree containing connections
+        @param sourceNode    The source node ID
+        @param sourcePort    The source port index
+        @param destNode      The target node ID
+        @param destPort      The target port index
+        @param checkMissing  If true, will return false if found but has the missing property
+    */
+    static bool connectionExists (const juce::ValueTree& arcs, const uint32 sourceNode, const uint32 sourcePort, const uint32 destNode, const uint32 destPort, const bool checkMissing = false);
+
+    /** Creates a default graph structure with optional name */
+    static Node createDefaultGraph (const juce::String& name = String());
+
+    /** Creates an empty graph model */
+    static Node createGraph (const juce::String& name = String());
+
+    /** Returns true if the value tree is probably a graph node */
+    static bool isProbablyGraphNode (const juce::ValueTree& data);
+
+    /** Removes unused id properties and resets the uuid */
+    static juce::ValueTree resetIds (const juce::ValueTree& data);
+
+    /** Load node data from file */
+    static juce::ValueTree parse (const juce::File& file);
+
+    /** Removes properties that can't be saved to a file. e.g. object properties */
+    static void sanitizeProperties (juce::ValueTree node, const bool recursive = false);
+
+    /** This is just an alias right now */
+    static void sanitizeRuntimeProperties (juce::ValueTree node, const bool recursive = false);
+
+    /** Create a value tree version of an arc */
+    static juce::ValueTree makeArc (const Arc& arc);
+
+    /** Create an Arc from a ValueTree */
+    static Arc arcFromValueTree (const juce::ValueTree& data);
+
+    /** Migrate an old data format to the current one. */
+    static juce::ValueTree migrate (const juce::ValueTree& data, juce::String& error) noexcept;
+
+private:
+    void setMissingProperties();
+    void forEach (const juce::ValueTree tree, std::function<void (const juce::ValueTree& tree)>) const;
+};
+
+class NodeObjectSync final : private juce::ValueTree::Listener {
+public:
+    NodeObjectSync();
+    NodeObjectSync (const Node& node);
+    ~NodeObjectSync();
+
+    void setNode (const Node&);
+    Node getNode() const { return node; }
+    void setFrozen (bool freeze) { frozen = freeze; }
+    bool isFrozen() const { return frozen; }
+
+private:
+    Node node;
+    juce::ValueTree data;
+    bool frozen = false;
+
+    void valueTreePropertyChanged (juce::ValueTree& tree, const juce::Identifier& property) override;
+    void valueTreeChildAdded (juce::ValueTree& parent, juce::ValueTree& child) override;
+    void valueTreeChildRemoved (juce::ValueTree& parent, juce::ValueTree& child, int index) override;
+    void valueTreeChildOrderChanged (juce::ValueTree& parent, int oldIndex, int newIndex) override;
+    void valueTreeParentChanged (juce::ValueTree& tree) override;
+    void valueTreeRedirected (juce::ValueTree& tree) override;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (NodeObjectSync)
+};
+
+class PortArray : public juce::Array<Port> {
+public:
+    PortArray() {}
+    ~PortArray() {}
+};
+
+class NodeArray : public juce::Array<Node> {
+public:
+    NodeArray() {}
+    ~NodeArray() {}
+    void sortByName();
+};
+
+struct ConnectionBuilder {
+    ConnectionBuilder (const ConnectionBuilder& o)
+    {
+        operator= (o);
+    }
+
+    ConnectionBuilder& operator= (const ConnectionBuilder& o)
+    {
+        this->arcs = o.arcs;
+        this->target = o.target;
+        this->lastError = o.lastError;
+        this->portChannelMap.addCopiesOf (
+            o.portChannelMap, 0, o.portChannelMap.size());
+        return *this;
+    }
+
+    ConnectionBuilder() : arcs (tags::arcs) {}
+    ConnectionBuilder (const Node& tgt)
+        : arcs (tags::arcs), target (tgt)
+    {
+    }
+
+    void setTarget (const Node& newTarget)
+    {
+        target = newTarget;
+    }
+
+    /** Add a port that will be connected to the target's channel
+        of the corresponding port type
+        */
+    ConnectionBuilder& addChannel (const Node& node, PortType t, const int sc, const int tc, bool input)
+    {
+        portChannelMap.add (new ConnectionMap (node, t, sc, tc, input));
+        return *this;
+    }
+
+    void connectStereo (const Node& src, const Node& dst, int srcOffset = 0, int dstOffset = 0)
+    {
+        if (srcOffset < 0)
+            srcOffset = 0;
+        if (dstOffset < 0)
+            dstOffset = 0;
+
+        for (int i = 0; i < 2; ++i) {
+            juce::ValueTree connection (types::Arc);
+            connection.setProperty (tags::sourceNode, (juce::int64) src.getNodeId(), 0)
+                .setProperty (tags::destNode, (juce::int64) dst.getNodeId(), 0)
+                .setProperty (tags::sourceChannel, i + srcOffset, 0)
+                .setProperty (tags::destChannel, i + dstOffset, 0);
+            arcs.addChild (connection, -1, 0);
+        }
+    }
+
+    void addConnections (GraphManager& controller, const uint32 targetNodeId) const;
+
+    String getError() const { return lastError; }
+
+private:
+    juce::ValueTree arcs;
+    Node target;
+    mutable String lastError;
+
+    struct ConnectionMap {
+        ConnectionMap (const Node& node, PortType t, const int nc, const int tc, const bool input)
+            : nodeId (node.getNodeId()),
+              type (t),
+              isInput (input),
+              nodeChannel (nc),
+              targetChannel (tc)
+        {
+        }
+
+        const uint32 nodeId;
+        const PortType type;
+        const bool isInput;
+        const int nodeChannel;
+        const int targetChannel;
+    };
+
+    juce::OwnedArray<ConnectionMap> portChannelMap;
+};
+
+} // namespace element

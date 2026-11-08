@@ -1,0 +1,159 @@
+// Copyright 2023 Kushview, LLC <info@kushview.net>
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#pragma once
+
+#include <element/juce/audio_devices.hpp>
+
+#include <element/midiiomonitor.hpp>
+#include <element/runmode.hpp>
+#include <element/session.hpp>
+#include <element/transport.hpp>
+
+namespace element {
+
+class Context;
+class Settings;
+class RootGraph;
+
+class AudioEngine final : public juce::ReferenceCountedObject {
+public:
+    Signal<void()> sampleLatencyChanged;
+    AudioEngine (Context&, RunMode mode = RunMode::Standalone);
+    virtual ~AudioEngine() noexcept;
+
+    //==========================================================================
+    RunMode getRunMode() const { return runMode; }
+
+    //==========================================================================
+    void activate();
+    void deactivate();
+
+    /** Adds a message to the MIDI input.  This can be used by Controllers and 
+        UI components that send MIDI in a non-realtime critical situation. Do 
+        not call this from the audio thread.
+     
+        @param msg                      The MidiMessage to send
+        @param handleOnDeviceQueue      When true will treat it as if received 
+                                        by a MidiInputDevice callback (don't use 
+                                        except for debugging)
+     */
+    void addMidiMessage (const juce::MidiMessage msg, bool handleOnDeviceQueue = false);
+
+    void applySettings (Settings&);
+
+    bool isUsingExternalClock() const;
+
+    void setSession (SessionPtr);
+    void refreshSession();
+
+    bool addGraph (RootGraph* graph);
+    bool removeGraph (RootGraph* graph);
+
+    /** Moves a root graph to a new position in the render order.
+
+        Engine indexes of all graphs are updated and the active graph stays
+        active. This is not an active graph change, so no crossfade or async
+        notification is triggered.
+
+        @param from The current engine index of the graph to move.
+        @param to   The engine index the graph should be moved to.
+        @return true if the graph was moved, false if either index was out of
+                range or the indexes were equal.
+    */
+    bool moveGraph (const int from, const int to);
+
+    void setActiveGraphIndex (const int index);
+    int getActiveGraphIndex() const;
+
+    RootGraph* getGraph (const int index);
+
+    void setPlaying (const bool shouldBePlaying);
+    void setRecording (const bool shouldBeRecording);
+    void seekToAudioFrame (const int64_t frame);
+    void setMeter (int beatsPerBar, int beatType);
+
+    void togglePlayPause();
+
+    /** Performs a transport bar action, see Transport::requestAction().
+
+        When hosted as a plugin the host playhead re-applies its own play and
+        record state every block, so the action is overridden there exactly as
+        the on-screen buttons are.
+
+        @param action The action to perform
+    */
+    void performTransportAction (TransportAction action);
+
+    juce::MidiKeyboardState& getKeyboardState();
+    Transport::MonitorPtr getTransportMonitor() const;
+    juce::AudioIODeviceCallback& getAudioIODeviceCallback();
+    juce::MidiInputCallback& getMidiInputCallback();
+
+    /** Returns the total number of audio IO callbacks processed so far.
+
+        Increments once per audio block while the device is running. Poll it
+        from a timer to detect a device whose callbacks have silently stopped.
+
+        @return the number of audio IO callbacks processed
+    */
+    uint64_t ioCallbackTicks() const;
+
+    /** Returns and clears the last device error reported by the audio device.
+
+        Errors are reported by some backends (e.g. CoreAudio) when a device
+        fails mid-stream. Safe to call from the message thread.
+
+        @return the last error message, or an empty string if none occurred
+    */
+    juce::String lastDeviceErrorMessage();
+
+    /** For use by external systems only! e.g. the AU/VST version of Element and
+        possibly things like rendering in the future
+     */
+    void prepareExternalPlayback (const double sampleRate, const int blockSize, const int numIns, const int numOuts);
+    void processExternalBuffers (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midi);
+    void processExternalPlayhead (juce::AudioPlayHead* playhead, const int nframes);
+    void releaseExternalResources();
+
+    /** Sets the audio workgroup that render worker threads should join.
+
+        For external systems that are handed a workgroup by their host. Safe to
+        call from the audio thread. Has no effect on platforms without workgroups.
+
+        @param workgroup the workgroup provided by the host
+    */
+    void setAudioWorkgroup (const juce::AudioWorkgroup& workgroup);
+
+    void updateExternalLatencySamples();
+    int getExternalLatencySamples() const;
+
+    Context& context() const;
+    MidiIOMonitorPtr getMidiIOMonitor() const;
+
+    struct LevelMeter : public juce::ReferenceCountedObject {
+        LevelMeter() noexcept {}
+        inline double level() const noexcept { return _level.get(); }
+
+    private:
+        friend class AudioEngine;
+
+        juce::Atomic<float> _level { 0 };
+        void updateLevel (const float* const*, int numChannels, int numSamples) noexcept;
+    };
+
+    using LevelMeterPtr = juce::ReferenceCountedObjectPtr<LevelMeter>;
+
+    LevelMeterPtr getLevelMeter (int channel, bool input);
+    int getNumChannels (bool input) const noexcept;
+
+private:
+    class Private;
+    std::unique_ptr<Private> priv;
+    Context& world;
+    RunMode runMode;
+};
+
+using AudioEnginePtr = juce::ReferenceCountedObjectPtr<AudioEngine>;
+
+} // namespace element

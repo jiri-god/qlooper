@@ -1,0 +1,23 @@
+// Copyright 2019-2023 Kushview, LLC <info@kushview.net>
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#pragma once
+
+// !!!! DO NOT INCLUDE THIS IN OTHER HEADERS !!!! //
+
+#include <element/services.hpp>
+#include <element/engine.hpp>
+#include <element/ui.hpp>
+#include <element/node.hpp>
+#include <element/session.hpp>
+#include <element/ui/commands.hpp>
+#include <element/context.hpp>
+#include <element/settings.hpp>
+
+#include "services/deviceservice.hpp"
+#include "services/mappingservice.hpp"
+#include "services/sessionservice.hpp"
+#include "services/presetservice.hpp"
+#include "nodes/nodetypes.hpp"
+#include "utils.hpp"
+#include "messages.hpp"

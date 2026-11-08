@@ -1,0 +1,344 @@
+// Copyright 2023 Kushview, LLC <info@kushview.net>
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include <math.h>
+
+#include <element/midipipe.hpp>
+#include <element/parameter.hpp>
+
+#include "luascripts.hpp"
+
+#include "engine/graphnode.hpp"
+#include "nodes/scriptnode.hpp"
+#include "scripting/bindings.hpp"
+#include "scripting/dspscript.hpp"
+#include "scripting/scriptloader.hpp"
+
+#define EL_LUA_DBG(x)
+// #define EL_LUA_DBG(x) DBG(x)
+
+static const juce::String initScript =
+    R"(
+require ('el.AudioBuffer')
+require ('el.MidiBuffer')
+require ('el.MidiMessage')
+require ('el.midi')
+require ('el.audio')
+require ('el.MidiPipe')
+)";
+
+namespace element {
+
+//=============================================================================
+ScriptNode::ScriptNode() noexcept
+    : Processor (0)
+{
+    setName ("Script");
+    Lua::initializeState (lua);
+
+    lua.set_function ("print", [this] (sol::variadic_args va) {
+        auto& e = lua;
+        String msg;
+        for (auto v : va)
+        {
+            if (sol::type::string == v.get_type())
+            {
+                msg << v.as<const char*>() << " ";
+                continue;
+            }
+
+            sol::function ts = e["tostring"];
+            if (ts.valid())
+            {
+                sol::object str = ts ((sol::object) v);
+                if (str.valid())
+                    if (const char* sstr = str.as<const char*>())
+                        msg << sstr << "  ";
+            }
+        }
+
+        if (msg.isNotEmpty())
+        {
+            if (MessageManager::getInstance()->isThisTheMessageThread())
+            {
+                Logger::writeToLog (msg);
+            }
+            else
+            {
+                MessageManagerLock ml;
+                Logger::writeToLog (msg);
+            }
+        }
+    });
+
+    script.reset (new DSPScript (lua.create_table()));
+
+    dspCode.replaceAllContent (String::fromUTF8 (
+        scripts::amp_lua, scripts::amp_luaSize));
+    loadScript (dspCode.getAllContent());
+    edCode.replaceAllContent (String::fromUTF8 (
+        scripts::ampui_lua, scripts::ampui_luaSize));
+
+    refreshPorts();
+}
+
+ScriptNode::~ScriptNode()
+{
+    script.reset();
+}
+
+void ScriptNode::refreshPorts()
+{
+    if (script == nullptr)
+        return;
+    PortList newPorts;
+    script->getPorts (newPorts);
+    setPorts (newPorts);
+    if (auto g = getParentGraph())
+        g->triggerAsyncUpdate();
+}
+
+void ScriptNode::setPlayHead (juce::AudioPlayHead* playhead)
+{
+    Processor::setPlayHead (playhead);
+    if (script)
+        script->setPlayHead (getPlayHead());
+}
+
+ParameterPtr ScriptNode::getParameter (const PortDescription& port)
+{
+    jassert (port.type == PortType::Control);
+    return script ? script->getParameterObject (port.channel, port.input) : nullptr;
+}
+
+Result ScriptNode::loadScript (const String& newCode)
+{
+    const auto result = loadScriptInternal (newCode);
+    scriptError = result.failed() ? result.getErrorMessage() : String();
+
+    if (result.failed())
+    {
+        String msg ("[script node] ");
+        if (getName().isNotEmpty())
+            msg << getName() << ": ";
+        msg << scriptError;
+        Logger::writeToLog (msg);
+    }
+
+    return result;
+}
+
+Result ScriptNode::loadScriptInternal (const String& newCode)
+{
+    auto result = DSPScript::validate (newCode);
+    if (result.failed())
+        return result;
+
+    ScopedLock sl (lock); // Lock EVERYTHING
+
+    ScriptLoader loader (lua);
+    loader.load (newCode);
+    if (loader.hasError())
+        return Result::fail (loader.getErrorMessage());
+
+    auto dsp = loader();
+    if (! dsp.valid() || dsp.get_type() != sol::type::table)
+        return Result::fail ("Could not instantiate script");
+
+    auto newScript = std::make_unique<DSPScript> (dsp);
+    newScript->setPlayHead (getPlayHead());
+    if (prepared)
+        newScript->prepare (sampleRate, blockSize);
+    triggerPortReset();
+
+    if (script != nullptr)
+        newScript->copyParameterValues (*script);
+    script.swap (newScript);
+
+    if (newScript != nullptr)
+    {
+        newScript->release();
+        newScript->cleanup();
+        newScript.reset();
+    }
+
+    return Result::ok();
+}
+
+void ScriptNode::getPluginDescription (PluginDescription& desc) const
+{
+    desc.name = "Script";
+    desc.fileOrIdentifier = EL_NODE_ID_SCRIPT;
+    desc.uniqueId = EL_NODE_UID_SCRIPT;
+    desc.descriptiveName = "A user scriptable Element node";
+    desc.numInputChannels = 0;
+    desc.numOutputChannels = 0;
+    desc.hasSharedContainer = false;
+    desc.isInstrument = false;
+    desc.manufacturerName = EL_NODE_FORMAT_AUTHOR;
+    desc.pluginFormatName = EL_NODE_FORMAT_NAME;
+    desc.version = "1.0.0";
+}
+
+void ScriptNode::prepareToRender (double rate, int block)
+{
+    if (prepared)
+        return;
+    sampleRate = rate;
+    blockSize = block;
+    script->prepare (sampleRate, blockSize);
+    prepared = true;
+}
+
+void ScriptNode::releaseResources()
+{
+    if (! prepared)
+        return;
+    prepared = false;
+    script->release();
+}
+
+void ScriptNode::render (RenderContext& rc)
+{
+    ScopedLock sl (lock);
+    script->process (rc.audio, rc.midi);
+}
+
+void ScriptNode::setState (const void* data, int size)
+{
+    const auto state = ValueTree::readFromGZIPData (data, size);
+    if (state.isValid())
+    {
+        dspCode.replaceAllContent (state["dspCode"].toString());
+        edCode.replaceAllContent (state["editorCode"].toString());
+
+        auto result = loadScript (dspCode.getAllContent());
+
+        if (result.wasOk())
+        {
+            if (state.hasProperty ("data"))
+            {
+                const var& data = state.getProperty ("data");
+                if (data.isBinaryData())
+                    if (auto* block = data.getBinaryData())
+                        script->restore (block->getData(), block->getSize());
+            }
+        }
+
+        sendChangeMessage();
+    }
+}
+
+void ScriptNode::getState (MemoryBlock& out)
+{
+    ValueTree state ("ScriptNode");
+    state.setProperty ("dspCode", dspCode.getAllContent(), nullptr)
+        .setProperty ("editorCode", edCode.getAllContent(), nullptr);
+
+    MemoryBlock block;
+    script->save (block);
+    if (block.getSize() > 0)
+        state.setProperty ("data", block, nullptr);
+    block.reset();
+
+    MemoryOutputStream mo (out, false);
+    {
+        GZIPCompressorOutputStream gz (mo);
+        state.writeToStream (gz);
+    }
+}
+
+void ScriptNode::setParameter (int index, float value)
+{
+    ScopedLock sl (lock);
+}
+
+//==============================================================================
+const String ScriptNode::getProgramName (int index) const
+{
+    if (! juce::isPositiveAndBelow (index, getNumPrograms()))
+        return {};
+
+    switch (index)
+    {
+        case 0:
+            return "Amp";
+            break;
+        case 1:
+            return "Channelizer";
+            break;
+        case 2:
+            return "Spoton Scale Chooser";
+            break;
+        case 3:
+            return "MIDI Timecode (MTC) Generator";
+            break;
+        case 4:
+            return "Value";
+            break;
+        case 5:
+            return "MIDI CC";
+            break;
+        case 6:
+            return "Tremolo";
+            break;
+        case 7:
+            return "Test Tone";
+            break;
+    }
+
+    String name = TRANS ("Program");
+    name << " " << int (index + 1);
+    return name;
+}
+
+void ScriptNode::setCurrentProgram (int index)
+{
+    if (! juce::isPositiveAndBelow (index, getNumPrograms()))
+        return;
+    _program = index;
+
+    String newDspCode, newUiCode;
+
+    switch (index)
+    {
+        case 0:
+            newDspCode = String::fromUTF8 (scripts::amp_lua, scripts::amp_luaSize);
+            newUiCode = String::fromUTF8 (scripts::ampui_lua, scripts::ampui_luaSize);
+            break;
+        case 1:
+            newDspCode = String::fromUTF8 (scripts::channelize_lua, scripts::channelize_luaSize);
+            newUiCode.clear();
+            break;
+        case 2:
+            newDspCode = String::fromUTF8 (scripts::spontonchordchooser_lua, scripts::spontonchordchooser_luaSize);
+            newUiCode.clear();
+            break;
+        case 3:
+            newDspCode = String::fromUTF8 (scripts::mtc_generator_lua, scripts::mtc_generator_luaSize);
+            newUiCode.clear();
+            break;
+        case 4:
+            newDspCode = String::fromUTF8 (scripts::dial_lua, scripts::dial_luaSize);
+            newUiCode.clear();
+            break;
+        case 5:
+            newDspCode = String::fromUTF8 (scripts::midicc_lua, scripts::midicc_luaSize);
+            newUiCode.clear();
+            break;
+        case 6:
+            newDspCode = String::fromUTF8 (scripts::tremolo_lua, scripts::tremolo_luaSize);
+            newUiCode.clear();
+            break;
+        case 7:
+            newDspCode = String::fromUTF8 (scripts::testtone_lua, scripts::testtone_luaSize);
+            newUiCode.clear();
+            break;
+    }
+
+    dspCode.replaceAllContent (newDspCode);
+    loadScript (dspCode.getAllContent());
+    edCode.replaceAllContent (newUiCode);
+}
+
+} // namespace element

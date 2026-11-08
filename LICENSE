@@ -1,0 +1,15 @@
+Q L o o p e r — release licensing notice
+
+This repository is not uniformly licensed. Original Element code and QLooper
+additions carrying GPL-3.0-or-later notices remain under those terms. Third-party
+code and assets retain their respective licences and copyright notices.
+
+The distributed executable combines that source with JUCE 8.0.13 under GNU
+AGPL version 3. GPLv3 section 13 permits the combination with AGPLv3; the GPL
+continues to apply to the GPL-covered portions and the AGPL's special interaction
+requirements apply to the combination as such. No proprietary JUCE entitlement
+is claimed for this release.
+
+Full texts: LICENSES/GPL-3.0-or-later.txt and LICENSES/AGPL-3.0-only.txt.
+See LICENSING.md and THIRD-PARTY-NOTICES.md for scope and corresponding source.
+No additional restriction on commercial use is imposed by this project.

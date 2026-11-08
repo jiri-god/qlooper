@@ -1,0 +1,1611 @@
+// Copyright 2014-2023 Kushview, LLC <info@kushview.net>
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include <array>
+#include <thread>
+
+#include <element/datapath.hpp>
+#include <element/node.hpp>
+#include <element/nodefactory.hpp>
+#include <element/plugins.hpp>
+#include <element/settings.hpp>
+
+#include "engine/clapprovider.hpp"
+#include "engine/ionode.hpp"
+#include "nodes/nodetypes.hpp"
+#include "utils.hpp"
+
+#define EL_DEAD_AUDIO_PLUGINS_FILENAME "scanner/crashed.txt"
+#define EL_PLUGIN_SCANNER_SLAVE_LIST_PATH "scanner/list.xml"
+#define EL_PLUGIN_SCANNER_WAITING_STATE "waiting"
+#define EL_PLUGIN_SCANNER_READY_STATE "ready"
+
+#define EL_PLUGIN_SCANNER_READY_ID "ready"
+#define EL_PLUGIN_SCANNER_START_ID "start"
+#define EL_PLUGIN_SCANNER_FINISHED_ID "finished"
+#define EL_PLUGIN_SCANNER_PROGRESS_ID "progress"
+
+#define EL_PLUGIN_SCANNER_DEFAULT_TIMEOUT 24000 // 24 Seconds
+
+#include <errno.h>
+extern char* program_invocation_name;
+
+#include "win32.hpp"
+
+#if JUCE_WINDOWS
+#include <process.h>
+#else
+#include <signal.h>
+#include <unistd.h>
+#endif
+
+namespace element {
+using namespace juce;
+
+namespace detail {
+static const char* pluginListKey() { return Settings::pluginListKey; }
+/* noop. prevent OS error dialogs from child process */
+static void pluginScannerCrashHandler (void*) {}
+static File pluginsXmlFile() { return DataPath::applicationDataDir().getChildFile ("plugins.xml"); }
+static File pluginMetadataXmlFile() { return DataPath::applicationDataDir().getChildFile ("plugin-metadata.xml"); }
+
+static FileSearchPath readSearchPath (const PropertiesFile& props, const String& f)
+{
+    const auto key = String (Settings::lastPluginScanPathPrefix) + f;
+    FileSearchPath sp (props.getValue (key));
+    return sp;
+}
+
+static File scannerExeFullPath()
+{
+    auto scannerExe = File::getSpecialLocation (File::currentExecutableFile);
+
+#if JUCE_LINUX
+    if (! scannerExe.existsAsFile())
+    {
+        std::array<char, PATH_MAX> path {};
+        const ssize_t len = readlink ("/proc/self/exe", path.data(), PATH_MAX - 1);
+        if (len > 0)
+        {
+            path[static_cast<size_t> (len)] = '\0';
+            scannerExe = File (String (path.data()));
+        }
+    }
+#endif
+
+    return scannerExe;
+}
+
+static juce::StringArray readDeadMansPedalFile()
+{
+    const auto file = DataPath::applicationDataDir().getChildFile (EL_DEAD_AUDIO_PLUGINS_FILENAME);
+    StringArray lines;
+    file.readLines (lines);
+    lines.removeEmptyStrings();
+    return lines;
+}
+
+static void setDeadMansPedalFile (const StringArray& newContents)
+{
+    auto deadMansPedalFile = DataPath::applicationDataDir().getChildFile (EL_DEAD_AUDIO_PLUGINS_FILENAME);
+    if (deadMansPedalFile.isDirectory())
+        deadMansPedalFile.deleteRecursively();
+    if (! deadMansPedalFile.exists())
+        deadMansPedalFile.create();
+    if (deadMansPedalFile.existsAsFile() && deadMansPedalFile.getFullPathName().isNotEmpty())
+        deadMansPedalFile.replaceWithText (newContents.joinIntoString ("\n"), true, true);
+}
+
+static void applyBlacklistingsFromDeadMansPedal (KnownPluginList& list)
+{
+    // If any plugins have crashed recently when being loaded, move them to the
+    // end of the list to give the others a chance to load correctly..
+    for (auto& crashedPlugin : readDeadMansPedalFile())
+        list.addToBlacklist (crashedPlugin);
+}
+
+static juce::int64 currentProcessId()
+{
+#if JUCE_WINDOWS
+    return static_cast<juce::int64> (_getpid());
+#else
+    return static_cast<juce::int64> (getpid());
+#endif
+}
+
+/** Forcibly terminates a process by ID. Used as a last resort on scanner
+    workers that a misbehaving plugin has left unable to exit on their own
+    (e.g. a load that never returns while holding the dynamic linker lock). */
+static void terminateProcess (juce::int64 pid)
+{
+    if (pid <= 0)
+        return;
+#if JUCE_WINDOWS
+    if (auto handle = OpenProcess (PROCESS_TERMINATE, FALSE, static_cast<DWORD> (pid)))
+    {
+        TerminateProcess (handle, 1);
+        CloseHandle (handle);
+    }
+#else
+    ::kill (static_cast<pid_t> (pid), SIGKILL);
+#endif
+}
+
+} // namespace detail
+
+//==============================================================================
+class PluginScannerCoordinator : public juce::ChildProcessCoordinator,
+                                 public std::enable_shared_from_this<PluginScannerCoordinator>
+{
+public:
+    explicit PluginScannerCoordinator (PluginScanner& o)
+        : owner (o) {}
+
+    ~PluginScannerCoordinator() {}
+
+    bool isLaunched() const noexcept { return launched.load(); }
+
+    /** Launches the worker process. Must be called on a shared_ptr managed
+        instance.  launchWorkerProcess uses ChildProcessManager on Linux which
+        is only safe on the message thread, so the launch is marshalled there
+        when called from the scan thread.
+
+        @param timeoutMs   IPC ping timeout handed to the worker connection
+        @param abortCheck  polled while waiting; return true to abandon
+        @return true if the worker process launched and connected
+    */
+    bool launch (int timeoutMs, std::function<bool()> abortCheck)
+    {
+        auto scannerExe = owner.scannerExeFile();
+        if (! scannerExe.existsAsFile())
+        {
+            Logger::writeToLog ("Failed to launch plugin scanner: exe not found.");
+            return false;
+        }
+
+        auto doLaunch = [this, scannerExe, timeoutMs]() -> bool {
+            Logger::writeToLog (String ("launching plugin scanner: ") + scannerExe.getFullPathName());
+            return launchWorkerProcess (scannerExe, EL_PLUGIN_SCANNER_PROCESS_ID, timeoutMs, 0);
+        };
+
+        if (MessageManager::getInstance()->isThisTheMessageThread())
+        {
+            if (! doLaunch())
+                return false;
+
+            if (! waitForWorkerReady (timeoutMs, abortCheck))
+            {
+                killWorkerProcess();
+                return false;
+            }
+
+            return launched = true;
+        }
+
+        struct LaunchState
+        {
+            juce::WaitableEvent done;
+            std::atomic<bool> ok { false };
+        };
+
+        auto state = std::make_shared<LaunchState>();
+
+        MessageManager::callAsync ([state, weak = std::weak_ptr<PluginScannerCoordinator> (shared_from_this()), doLaunch]() {
+            if (auto self = weak.lock())
+                state->ok = doLaunch();
+            state->done.signal();
+        });
+
+        const auto deadline = Time::getMillisecondCounter() + static_cast<uint32> (timeoutMs) + 5000;
+        while (! state->done.wait (50))
+            if (abortCheck() || Time::getMillisecondCounter() > deadline)
+                return false;
+
+        if (! state->ok.load())
+            return false;
+
+        // The pipe exists as soon as the process starts, so wait for the
+        // worker's ready handshake to confirm it actually connected. A lost
+        // connection after this point means the scanned plugin took the
+        // worker down; before it, the scanner itself is unavailable.
+        if (! waitForWorkerReady (timeoutMs, abortCheck))
+        {
+            killWorkerProcess(); // safe: launchWorkerProcess has completed
+            return false;
+        }
+
+        return launched = true;
+    }
+
+    enum class State
+    {
+        timeout,
+        gotResult,
+        progress,
+        connectionLost,
+    };
+
+    struct Response
+    {
+        State state;
+        std::unique_ptr<XmlElement> xml;
+    };
+
+    Response getResponse()
+    {
+        std::unique_lock<std::mutex> lock { mutex };
+
+        if (! condvar.wait_for (lock, std::chrono::milliseconds { 50 }, [&] { return gotResult || gotProgress || connectionLost; }))
+            return { State::timeout, nullptr };
+
+        if (connectionLost)
+        {
+            connectionLost = false;
+            gotResult = gotProgress = false;
+            return { State::connectionLost, nullptr };
+        }
+
+        if (gotResult)
+        {
+            gotResult = gotProgress = false;
+            return { State::gotResult, std::move (pluginDescription) };
+        }
+
+        gotProgress = false;
+        return { State::progress, nullptr };
+    }
+
+    void handleMessageFromWorker (const MemoryBlock& mb) override
+    {
+        const std::lock_guard<std::mutex> lock { mutex };
+
+        const auto message = mb.toString();
+        if (message.startsWith (EL_PLUGIN_SCANNER_READY_ID))
+        {
+            // "ready:<pid>" — the pid enables force-killing a hung worker.
+            workerPid = message.fromFirstOccurrenceOf (":", false, false).getLargeIntValue();
+            workerReady = true;
+            condvar.notify_one();
+            return;
+        }
+
+        if (message.startsWith (EL_PLUGIN_SCANNER_PROGRESS_ID))
+        {
+            // Heartbeat sent while the worker is still inside a single,
+            // possibly slow findAllTypesForFile call (e.g. a VST3 shell
+            // plugin enumerating many housed sub-plugins).
+            gotProgress = true;
+            condvar.notify_one();
+            return;
+        }
+
+        pluginDescription = juce::parseXML (message);
+        gotResult = true;
+        condvar.notify_one();
+    }
+
+    /** Kills the worker connection and forcibly terminates the worker
+        process. A worker hung inside a plugin's load code cannot process the
+        kill message or exit on its own, so the OS process must be killed. */
+    void terminateWorkerProcess()
+    {
+        killWorkerProcess();
+        detail::terminateProcess (workerPid.exchange (0));
+    }
+
+    void handleConnectionLost() override
+    {
+        const std::lock_guard<std::mutex> lock { mutex };
+        connectionLost = true;
+        condvar.notify_one();
+    }
+
+private:
+    PluginScanner& owner;
+
+    std::mutex mutex;
+    std::condition_variable condvar;
+
+    std::unique_ptr<XmlElement> pluginDescription;
+    bool connectionLost = false;
+    bool gotResult = false;
+    bool gotProgress = false;
+    bool workerReady = false;
+    std::atomic<bool> launched { false };
+    std::atomic<juce::int64> workerPid { 0 };
+
+    bool waitForWorkerReady (int timeoutMs, const std::function<bool()>& abortCheck)
+    {
+        const auto deadline = Time::getMillisecondCounter() + static_cast<uint32> (timeoutMs);
+        std::unique_lock<std::mutex> lock { mutex };
+
+        for (;;)
+        {
+            if (condvar.wait_for (lock, std::chrono::milliseconds { 50 }, [&] { return workerReady || connectionLost; }))
+            {
+                if (workerReady)
+                    return true;
+                connectionLost = false; // consumed here: launch failure, not a crash
+                return false;
+            }
+
+            if (abortCheck() || Time::getMillisecondCounter() >= deadline)
+                return false;
+        }
+    }
+};
+
+//==============================================================================
+class PluginScannerWorker : public juce::ChildProcessWorker,
+                            public juce::AsyncUpdater
+{
+public:
+    PluginScannerWorker()
+    {
+        SystemStats::setApplicationCrashHandler (detail::pluginScannerCrashHandler);
+        auto logfile = DataPath::applicationDataDir().getChildFile ("log/scanner.log");
+        logfile.create();
+        logger = std::make_unique<juce::FileLogger> (logfile, "Plugin Scanner");
+        Logger::setCurrentLogger (logger.get());
+    }
+
+    ~PluginScannerWorker()
+    {
+        Logger::setCurrentLogger (nullptr);
+    }
+
+    void handleMessageFromCoordinator (const MemoryBlock& mb) override
+    {
+        if (mb.isEmpty())
+            return;
+
+        const std::lock_guard<std::mutex> lock (mutex);
+
+        if (const auto results = doScan (mb); ! results.isEmpty())
+        {
+            sendResults (results);
+        }
+        else
+        {
+            pendingBlocks.emplace (mb);
+            triggerAsyncUpdate();
+        }
+    }
+
+    void handleAsyncUpdate() override
+    {
+        for (;;)
+        {
+            const std::lock_guard<std::mutex> lock (mutex);
+
+            if (pendingBlocks.empty())
+                return;
+
+            sendResults (doScan (pendingBlocks.front()));
+            pendingBlocks.pop();
+        }
+    }
+
+    OwnedArray<PluginDescription> doScan (const MemoryBlock& block)
+    {
+        MemoryInputStream stream { block, false };
+        const auto formatName = stream.readString();
+        const auto identifier = stream.readString();
+        String msg = "scan: ";
+        msg << formatName << ": " << identifier;
+        logger->logMessage (msg);
+        return nullptr == plugins->getAudioPluginFormat (formatName)
+                   ? scanProvider (formatName, identifier)
+                   : scanJuce (formatName, identifier);
+    }
+
+    OwnedArray<PluginDescription> scanJuce (const String& formatName, const String& identifier)
+    {
+        PluginDescription pd;
+        pd.pluginFormatName = formatName;
+        pd.fileOrIdentifier = identifier;
+        pd.uniqueId = pd.deprecatedUid = 0;
+
+        const auto matchingFormat = plugins->getAudioPluginFormat (formatName);
+
+        OwnedArray<PluginDescription> results;
+
+        if (matchingFormat != nullptr
+            && (MessageManager::getInstance()->isThisTheMessageThread()
+                || matchingFormat->requiresUnblockedMessageThreadDuringCreation (pd)))
+        {
+            // findAllTypesForFile can block for a long time with no feedback
+            // in between (e.g. a VST3 shell plugin such as WaveShell
+            // enumerating many housed sub-plugins), so send heartbeats to
+            // let the coordinator tell a slow scan from a wedged one.
+            std::mutex hbMutex;
+            std::condition_variable hbCondvar;
+            bool scanning = true;
+
+            std::thread heartbeat ([this, &hbMutex, &hbCondvar, &scanning] {
+                std::unique_lock<std::mutex> lock { hbMutex };
+                while (! hbCondvar.wait_for (lock, std::chrono::seconds (1), [&] { return ! scanning; }))
+                {
+                    const String msg (EL_PLUGIN_SCANNER_PROGRESS_ID);
+                    sendMessageToCoordinator ({ msg.toRawUTF8(), msg.getNumBytesAsUTF8() });
+                }
+            });
+
+            matchingFormat->findAllTypesForFile (results, identifier);
+
+            {
+                const std::lock_guard<std::mutex> lock { hbMutex };
+                scanning = false;
+            }
+            hbCondvar.notify_one();
+            heartbeat.join();
+        }
+
+        return results;
+    }
+
+    OwnedArray<PluginDescription> scanProvider (const String& format, const String& ID)
+    {
+        auto& nodes = plugins->getNodeFactory();
+
+        OwnedArray<PluginDescription> results;
+
+        for (auto* p : nodes.providers())
+        {
+            if (p->format() != format)
+                continue;
+
+#if 0
+            if (auto inst = p->create (ID))
+            {
+                auto d = results.add (new PluginDescription());
+                inst->getPluginDescription (*d);
+            }
+#else
+            p->scan (ID, results);
+#endif
+
+            break;
+        }
+
+        return results;
+    }
+
+    void sendResults (const OwnedArray<PluginDescription>& results)
+    {
+        XmlElement xml ("LIST");
+
+        for (const auto& desc : results)
+            xml.addChildElement (desc->createXml().release());
+
+        const auto str = xml.toString();
+        sendMessageToCoordinator ({ str.toRawUTF8(), str.getNumBytesAsUTF8() });
+    }
+
+    void handleConnectionMade() override
+    {
+        logger->logMessage ("[scanner] connection to coordinator established");
+        logger->logMessage ("[scanner] creating global objects");
+        settings = std::make_unique<Settings>();
+        plugins = std::make_unique<PluginManager>();
+
+        logger->logMessage ("[scanner] setting up formats");
+        auto& nf = plugins->getNodeFactory();
+        nf.add (new CLAPProvider());
+        plugins->addDefaultFormats();
+        plugins->setPlayConfig (48000.0, 1024);
+
+        logger->logMessage ("[scanner] ready");
+        const auto msg = String (EL_PLUGIN_SCANNER_READY_ID) + ":" + String (detail::currentProcessId());
+        sendMessageToCoordinator ({ msg.toRawUTF8(), msg.getNumBytesAsUTF8() });
+    }
+
+    void handleConnectionLost() override
+    {
+        logger->logMessage ("[scanner] connection lost");
+        logger.reset();
+        settings = nullptr;
+        plugins = nullptr;
+        JUCEApplication::quit();
+    }
+
+private:
+    std::unique_ptr<Settings> settings;
+    std::unique_ptr<PluginManager> plugins;
+    std::mutex mutex;
+    std::queue<MemoryBlock> pendingBlocks;
+    std::unique_ptr<juce::FileLogger> logger;
+};
+
+//==============================================================================
+PluginScanner::PluginScanner (PluginManager& manager)
+    : juce::Thread ("elscan"),
+      _manager (manager),
+      list (manager.getKnownPlugins()),
+      _scannerExe (detail::scannerExeFullPath()),
+      launchTimeoutMs (EL_PLUGIN_SCANNER_DEFAULT_TIMEOUT)
+{
+    // Force-create the master weak reference on this thread so copies made
+    // from the scan thread never race its lazy initialization.
+    juce::WeakReference<PluginScanner> (this);
+}
+
+PluginScanner::~PluginScanner()
+{
+    cancel();
+    stopThread (5000);
+    masterReference.clear();
+    listeners.clear();
+    superprocess.reset();
+}
+
+void PluginScanner::cancel()
+{
+    cancelFlag = 1;
+}
+
+bool PluginScanner::isScanning() const { return scanning.load(); }
+
+bool PluginScanner::shouldAbort() const noexcept
+{
+    return cancelFlag.get() != 0 || threadShouldExit();
+}
+
+bool PluginScanner::waitForScanToFinish (int timeoutMs)
+{
+    const auto deadline = Time::getMillisecondCounter() + static_cast<uint32> (timeoutMs);
+    const bool onMessageThread = MessageManager::getInstance()->isThisTheMessageThread();
+
+    while (isScanning())
+    {
+        if (Time::getMillisecondCounter() >= deadline)
+            return false;
+
+        if (onMessageThread)
+            MessageManager::getInstance()->runDispatchLoopUntil (20);
+        else
+            Thread::sleep (20);
+    }
+
+    // Deliver the queued audioPluginScanFinished callback.
+    if (onMessageThread)
+        MessageManager::getInstance()->runDispatchLoopUntil (20);
+
+    return true;
+}
+
+juce::String PluginScanner::getLastScanError() const
+{
+    ScopedLock sl (stateLock);
+    return lastScanError;
+}
+
+void PluginScanner::resetWorker (bool alsoKill)
+{
+    if (superprocess != nullptr && alsoKill && superprocess->isLaunched())
+        superprocess->terminateWorkerProcess();
+    superprocess.reset();
+}
+
+void PluginScanner::notifyOnMessageThread (std::function<void (PluginScanner&)> fn)
+{
+    MessageManager::callAsync ([weak = juce::WeakReference<PluginScanner> (this), fn = std::move (fn)]() {
+        if (auto* self = weak.get())
+            fn (*self);
+    });
+}
+
+PluginScanner::ScanResult PluginScanner::retrieveDescriptions (const String& formatName,
+                                                               const String& fileOrIdentifier,
+                                                               OwnedArray<PluginDescription>& result)
+{
+    if (superprocess == nullptr)
+    {
+        superprocess = std::make_shared<PluginScannerCoordinator> (*this);
+        if (! superprocess->launch (launchTimeoutMs, [this]() { return shouldAbort(); }))
+        {
+            // Don't kill: an abandoned launch may still be in flight on the
+            // message thread. Dropping the reference is enough.
+            resetWorker (false);
+            return shouldAbort() ? ScanResult::cancelled : ScanResult::unavailable;
+        }
+    }
+
+    MemoryBlock block;
+    MemoryOutputStream stream { block, true };
+    stream.writeString (formatName);
+    stream.writeString (fileOrIdentifier);
+
+    if (! superprocess->sendMessageToWorker (block))
+    {
+        resetWorker (true);
+        return ScanResult::unavailable;
+    }
+
+    using State = PluginScannerCoordinator::State;
+    auto deadline = Time::getMillisecondCounter() + static_cast<uint32> (perPluginTimeoutMs);
+
+    for (;;)
+    {
+        if (shouldAbort())
+            return ScanResult::cancelled;
+
+        const auto response = superprocess->getResponse();
+
+        if (response.state == State::timeout)
+        {
+            if (Time::getMillisecondCounter() >= deadline)
+            {
+                Logger::writeToLog (String ("plugin scan timed out: ") + fileOrIdentifier);
+                resetWorker (true);
+                return ScanResult::crashed;
+            }
+            continue;
+        }
+
+        if (response.state == State::progress)
+        {
+            // The worker is still alive and working on this plugin, so
+            // push the deadline out rather than treating it as wedged.
+            deadline = Time::getMillisecondCounter() + static_cast<uint32> (perPluginTimeoutMs);
+            notifyOnMessageThread ([name = File::createFileWithoutCheckingPath (fileOrIdentifier).getFileName()] (PluginScanner& s) {
+                s.listeners.call (&Listener::audioPluginScanStarted, name + "…");
+            });
+            continue;
+        }
+
+        if (response.state == State::connectionLost)
+        {
+            Logger::writeToLog (String ("plugin scanner crashed on: ") + fileOrIdentifier);
+            resetWorker (true);
+            return ScanResult::crashed;
+        }
+
+        if (response.xml != nullptr)
+        {
+            for (const auto* item : response.xml->getChildIterator())
+            {
+                auto desc = std::make_unique<PluginDescription>();
+
+                if (desc->loadFromXml (*item))
+                    result.add (std::move (desc));
+            }
+        }
+
+        return ScanResult::ok;
+    }
+}
+
+File PluginScanner::scannerExeFile() const noexcept { return _scannerExe; }
+
+void PluginScanner::scanAudioFormat (const String& formatName)
+{
+    detail::applyBlacklistingsFromDeadMansPedal (list);
+    auto paths = _manager.props != nullptr
+                     ? detail::readSearchPath (*_manager.props, formatName)
+                     : FileSearchPath();
+    StringArray identifiers;
+    std::function<String (const String&)> pluginName = [] (const String& ID) -> juce::String { return ID; };
+
+    if (auto* format = _manager.getAudioPluginFormat (formatName))
+    {
+        pluginName = [format] (const String& ID) {
+            return format->getNameOfPluginFromIdentifier (ID);
+        };
+
+        if (paths.getNumPaths() <= 0)
+            paths = format->getDefaultLocationsToSearch();
+
+        identifiers = format->searchPathsForPlugins (paths, true, false);
+    }
+    else if (auto* provider = _manager.getProvider (formatName))
+    {
+        if (paths.getNumPaths() <= 0)
+            paths = provider->defaultSearchPath();
+
+        identifiers = provider->findTypes (paths, true, false);
+    }
+
+    notifyOnMessageThread ([] (PluginScanner& s) {
+        s.listeners.call (&Listener::audioPluginScanProgress, 0.0f);
+    });
+
+    const auto total = static_cast<float> (identifiers.size());
+    for (int i = 0; i < identifiers.size(); ++i)
+    {
+        const auto& ID = identifiers.getReference (i);
+
+        const auto reportProgress = [this, i, total]() {
+            const float progress = static_cast<float> (i + 1) / total;
+            notifyOnMessageThread ([progress] (PluginScanner& s) {
+                s.listeners.call (&Listener::audioPluginScanProgress, progress);
+            });
+        };
+
+        if (shouldAbort())
+            return;
+
+        notifyOnMessageThread ([name = pluginName (ID)] (PluginScanner& s) {
+            s.listeners.call (&Listener::audioPluginScanStarted, name);
+        });
+
+        if (list.getTypeForFile (ID) || list.getBlacklistedFiles().contains (ID))
+        {
+            reportProgress();
+            continue;
+        }
+
+        OwnedArray<PluginDescription> descriptions;
+
+        // Add to the dead-man's-pedal before scanning so the entry survives
+        // if this plugin takes down the whole application.
+        auto crashed = detail::readDeadMansPedalFile();
+        crashed.removeString (ID);
+        crashed.add (ID);
+        detail::setDeadMansPedalFile (crashed);
+
+        const auto removeFromPedal = [&crashed, &ID]() {
+            crashed.removeString (ID);
+            detail::setDeadMansPedalFile (crashed);
+        };
+
+        switch (retrieveDescriptions (formatName, ID, descriptions))
+        {
+            case ScanResult::ok:
+                consecutiveFailures = 0;
+                for (auto* desc : descriptions)
+                    list.addType (*desc);
+                // Managed to load without crashing, so remove it from the dead-man's-pedal..
+                removeFromPedal();
+                if (descriptions.size() == 0 && ! list.getBlacklistedFiles().contains (ID))
+                    failedIdentifiers.add (ID);
+                break;
+
+            case ScanResult::crashed:
+                // Leave the ID on the dead-man's-pedal so it gets blacklisted.
+                consecutiveFailures = 0;
+                if (! list.getBlacklistedFiles().contains (ID))
+                    failedIdentifiers.add (ID);
+                break;
+
+            case ScanResult::unavailable:
+                // The scanner process itself failed. Not the plugin's fault:
+                // never blacklist it.
+                removeFromPedal();
+                if (++consecutiveFailures >= maxConsecutiveFailures)
+                {
+                    abortedByFailure = true;
+                    {
+                        ScopedLock sl (stateLock);
+                        lastScanError = TRANS ("Plugin scanning stopped early because the "
+                                               "scanner process could not be started or "
+                                               "kept failing.");
+                    }
+                    return;
+                }
+                break;
+
+            case ScanResult::cancelled:
+                removeFromPedal();
+                return;
+        }
+
+        reportProgress();
+    }
+}
+
+void PluginScanner::scanForAudioPlugins (const juce::String& formatName)
+{
+    const juce::StringArray identifiers { formatName };
+    scanForAudioPlugins (identifiers);
+}
+
+void PluginScanner::scanForAudioPlugins (const StringArray& formats)
+{
+    if (isThreadRunning() || scanning.load())
+        return;
+
+    formatsToScan = formats;
+    cancelFlag = 0;
+    abortedByFailure = false;
+    consecutiveFailures = 0;
+    failedIdentifiers.clearQuick();
+    {
+        ScopedLock sl (stateLock);
+        lastScanError.clear();
+    }
+
+    // Set before startThread so isScanning() is true immediately.
+    scanning = true;
+    startThread();
+}
+
+void PluginScanner::run()
+{
+    if (scannerExeFile().existsAsFile())
+    {
+        detail::setDeadMansPedalFile ({});
+
+        for (const auto& format : formatsToScan)
+        {
+            scanAudioFormat (format);
+            if (shouldAbort() || abortedByFailure)
+                break;
+        }
+
+        resetWorker (true);
+
+        auto crashed = detail::readDeadMansPedalFile();
+        for (const auto& c : failedIdentifiers)
+            crashed.add (c);
+        crashed.removeDuplicates (false);
+        crashed.removeEmptyStrings();
+        detail::setDeadMansPedalFile (crashed);
+        detail::applyBlacklistingsFromDeadMansPedal (list);
+        detail::setDeadMansPedalFile ({});
+    }
+    else
+    {
+        ScopedLock sl (stateLock);
+        lastScanError = TRANS ("The plugin scanner executable is missing.");
+    }
+
+    cancelFlag = 0;
+    scanning = false;
+    notifyOnMessageThread ([] (PluginScanner& s) {
+        s.listeners.call (&Listener::audioPluginScanFinished);
+    });
+}
+
+//==============================================================================
+using UnverifiedPluginMap = HashMap<String, StringArray>;
+using UnverifiedPluginPaths = HashMap<String, FileSearchPath>;
+
+class UnverifiedPlugins : private Thread
+{
+public:
+    UnverifiedPlugins() : Thread ("euvpl") {}
+
+    ~UnverifiedPlugins()
+    {
+        cancelFlag.set (1);
+        if (isThreadRunning())
+            stopThread (1000);
+    }
+
+    void searchForPlugins (PropertiesFile* props)
+    {
+        if (isThreadRunning())
+            return;
+
+        if (props)
+        {
+            for (const auto& f : Util::compiledAudioPluginFormats())
+            {
+                const auto key = String (Settings::lastPluginScanPathPrefix) + f;
+                paths.set (f, FileSearchPath (props->getValue (key)));
+            }
+        }
+        else
+        {
+            paths.clear();
+        }
+
+        startThread (Thread::Priority::background);
+    }
+
+    void getPlugins (OwnedArray<PluginDescription>& plugs,
+                     const String& format,
+                     KnownPluginList& list)
+    {
+        ScopedLock sl (lock);
+        if (plugins.contains (format))
+        {
+            const auto types = list.getTypes();
+            for (const auto& file : plugins.getReference (format))
+            {
+                bool known = nullptr != list.getTypeForFile (file);
+                // Provider formats (e.g. CLAP) store types as "pluginID:filePath".
+                for (int i = types.size(); --i >= 0 && ! known;)
+                {
+                    const auto& d = types.getReference (i);
+                    known = d.pluginFormatName == format
+                            && d.fileOrIdentifier.fromFirstOccurrenceOf (":", false, false) == file;
+                }
+                if (known)
+                    continue;
+                auto* const desc = plugs.add (new PluginDescription());
+                desc->pluginFormatName = format;
+                desc->fileOrIdentifier = file;
+            }
+        }
+    }
+
+private:
+    friend class Thread;
+    CriticalSection lock;
+    UnverifiedPluginMap plugins;
+    UnverifiedPluginPaths paths;
+
+    struct Item
+    {
+        String name;
+        String identifier;
+    };
+
+    Atomic<int> cancelFlag;
+
+    void run() override
+    {
+        cancelFlag.set (0);
+
+        PluginManager pluginManager;
+        pluginManager.getNodeFactory().add (new CLAPProvider());
+        pluginManager.addDefaultFormats();
+        auto& manager (pluginManager.getAudioPluginFormats());
+
+        // JUCE Formats.
+        for (int i = 0; i < manager.getNumFormats(); ++i)
+        {
+            if (threadShouldExit() || cancelFlag.get() != 0)
+                break;
+
+            auto* const format = manager.getFormat (i);
+            FileSearchPath path = paths[format->getName()];
+            path.addPath (format->getDefaultLocationsToSearch());
+            const auto found = format->searchPathsForPlugins (path, true, false);
+
+            ScopedLock sl (lock);
+            plugins.set (format->getName(), found);
+        }
+
+        // Element Node Providers
+        auto& factory = pluginManager.getNodeFactory();
+        for (auto* const provider : factory.providers())
+        {
+            if (threadShouldExit() || cancelFlag.get() != 0)
+                break;
+
+            const auto formatName = provider->format();
+            FileSearchPath path = paths[formatName];
+            path.addPath (provider->defaultSearchPath());
+            // Providers with no search path (e.g. internal nodes) aren't file-based.
+            if (path.getNumPaths() <= 0)
+                continue;
+            const auto found = provider->findTypes (path, true, false);
+
+            ScopedLock sl (lock);
+            plugins.set (formatName, found);
+        }
+
+        cancelFlag.set (0);
+    }
+};
+
+//==============================================================================
+class PluginManager::Private : public PluginScanner::Listener
+{
+public:
+    Private (PluginManager& o)
+        : owner (o)
+    {
+        deadAudioPlugins = DataPath::applicationDataDir().getChildFile (EL_DEAD_AUDIO_PLUGINS_FILENAME);
+    }
+
+    ~Private() {}
+
+    /** returns true if anything changed in the plugin list */
+    bool updateBlacklistedAudioPlugins()
+    {
+        bool didSomething = false;
+
+        if (deadAudioPlugins.existsAsFile())
+        {
+            PluginDirectoryScanner::applyBlacklistingsFromDeadMansPedal (
+                allPlugins, deadAudioPlugins);
+            deadAudioPlugins.deleteFile();
+            didSomething = true;
+        }
+
+        return didSomething;
+    }
+
+    void searchUnverifiedPlugins (PropertiesFile* props)
+    {
+        unverified.searchForPlugins (props);
+    }
+
+    /** Load hidden/favorite curation from a metadata file (keyed by
+        PluginDescription::createIdentifierString()). */
+    void loadPluginMetadata (const File& file)
+    {
+        hiddenPlugins.clearQuick();
+        favoritePlugins.clearQuick();
+
+        auto xml = XmlDocument::parse (file);
+        if (xml == nullptr || ! xml->hasTagName (types::PluginMetadata.toString()))
+            return;
+
+        for (auto* const e : xml->getChildWithTagNameIterator (tags::plugin.toString()))
+        {
+            const auto id = e->getStringAttribute (tags::identifier.toString());
+            if (id.isEmpty())
+                continue;
+            if (e->getBoolAttribute (tags::hidden.toString()))
+                hiddenPlugins.addIfNotAlreadyThere (id);
+            if (e->getBoolAttribute (tags::favorite.toString()))
+                favoritePlugins.addIfNotAlreadyThere (id);
+        }
+    }
+
+    /** Persist hidden/favorite curation. Only non-default entries are written. */
+    void savePluginMetadata (const File& file)
+    {
+        XmlElement xml (types::PluginMetadata.toString());
+
+        StringArray ids;
+        ids.addArray (hiddenPlugins);
+        ids.addArray (favoritePlugins);
+        ids.removeDuplicates (false);
+
+        for (const auto& id : ids)
+        {
+            auto* const e = xml.createNewChildElement (tags::plugin.toString());
+            e->setAttribute (tags::identifier.toString(), id);
+            if (hiddenPlugins.contains (id))
+                e->setAttribute (tags::hidden.toString(), 1);
+            if (favoritePlugins.contains (id))
+                e->setAttribute (tags::favorite.toString(), 1);
+        }
+
+        file.getParentDirectory().createDirectory();
+        xml.writeTo (file);
+    }
+
+    void getUnverifiedPlugins (const String& format, OwnedArray<PluginDescription>& plugs)
+    {
+        unverified.getPlugins (plugs, format, allPlugins);
+    }
+
+private:
+    friend class PluginManager;
+    PluginManager& owner;
+    AudioPluginFormatManager formats;
+    KnownPluginList allPlugins;
+    StringArray hiddenPlugins, favoritePlugins;
+    File deadAudioPlugins;
+    UnverifiedPlugins unverified;
+    NodeFactory nodes;
+    double sampleRate = 44100.0;
+    int blockSize = 512;
+    std::unique_ptr<PluginScanner> scanner;
+    bool hasAddedFormats = false;
+
+    void scanAudioPlugins (const StringArray& names)
+    {
+        if (scanner)
+        {
+            scanner->removeListener (this);
+            scanner->cancel();
+            scanner = nullptr;
+        }
+
+        StringArray formatsToScan = names;
+        if (formatsToScan.isEmpty())
+        {
+            for (int i = 0; i < formats.getNumFormats(); ++i)
+                if (formats.getFormat (i)->getName() != "Element" && formats.getFormat (i)->canScanForPlugins())
+                    formatsToScan.add (formats.getFormat (i)->getName());
+            formatsToScan.add ("LV2");
+        }
+
+        scanner = std::make_unique<PluginScanner> (owner);
+        scanner->addListener (this);
+        scanner->scanForAudioPlugins (formatsToScan);
+    }
+
+    void audioPluginScanFinished() override
+    {
+        {
+            ScopedLock sl (lock);
+            scannedPlugin = String();
+            progress = -1.0;
+        }
+
+        owner.scanFinished();
+    }
+
+    void audioPluginScanStarted (const String& plugin) override
+    {
+        DBG ("[element] scanning: " << plugin);
+        ScopedLock sl (lock);
+        scannedPlugin = plugin;
+    }
+
+    void audioPluginScanProgress (const float p) override
+    {
+        ScopedLock sl (lock);
+        progress = p;
+    }
+
+    String getScannedPluginName() const
+    {
+        ScopedLock sl (lock);
+        return scannedPlugin;
+    }
+
+private:
+    CriticalSection lock;
+    String scannedPlugin;
+    float progress = -1.0;
+};
+
+PluginManager::PluginManager()
+{
+    priv.reset (new Private (*this));
+}
+
+PluginManager::~PluginManager()
+{
+    priv.reset();
+}
+
+void PluginManager::addDefaultFormats()
+{
+    if (priv->hasAddedFormats)
+        return;
+
+    auto& audioPlugs = getAudioPluginFormats();
+    for (const auto& fmt : Util::compiledAudioPluginFormats())
+    {
+        if (fmt == "")
+            continue;
+
+#if JUCE_MAC && JUCE_PLUGINHOST_AU
+        else if (fmt == "AudioUnit")
+            audioPlugs.addFormat (std::make_unique<AudioUnitPluginFormat>());
+#endif
+
+#if JUCE_PLUGINHOST_VST
+        else if (fmt == "VST")
+            audioPlugs.addFormat (std::make_unique<VSTPluginFormat>());
+#endif
+
+#if JUCE_PLUGINHOST_VST3
+        else if (fmt == "VST3")
+            audioPlugs.addFormat (std::make_unique<VST3PluginFormat>());
+#endif
+
+#if JUCE_PLUGINHOST_LV2
+        else if (fmt == "LV2")
+            audioPlugs.addFormat (std::make_unique<LV2PluginFormat>());
+#endif
+
+#if JUCE_PLUGINHOST_LADSPA
+        else if (fmt == "LADSPA")
+            audioPlugs.addFormat (std::make_unique<LADSPAPluginFormat>());
+#endif
+    }
+
+    priv->hasAddedFormats = true;
+}
+
+void PluginManager::addFormat (std::unique_ptr<juce::AudioPluginFormat> fmt)
+{
+    getAudioPluginFormats().addFormat (std::move (fmt));
+}
+
+NodeFactory& PluginManager::getNodeFactory() { return priv->nodes; }
+
+FileSearchPath PluginManager::defaultSearchPath (juce::StringRef formatName) const noexcept
+{
+    if (auto apf = getAudioPluginFormat (formatName))
+        return apf->getDefaultLocationsToSearch();
+
+    for (auto provider : priv->nodes.providers())
+        if (provider->format() == formatName)
+            return provider->defaultSearchPath();
+
+    return {};
+}
+
+void PluginManager::addToKnownPlugins (const PluginDescription& desc)
+{
+    auto* const format = getAudioPluginFormat (desc.pluginFormatName);
+    auto& list = priv->allPlugins;
+    if (format && nullptr == list.getTypeForFile (desc.fileOrIdentifier))
+    {
+        OwnedArray<PluginDescription> dummy;
+        list.removeFromBlacklist (desc.fileOrIdentifier);
+        list.scanAndAddFile (desc.fileOrIdentifier, true, dummy, *format);
+    }
+}
+
+void PluginManager::searchUnverifiedPlugins()
+{
+    if (! priv)
+        return;
+    priv->searchUnverifiedPlugins (this->props);
+}
+
+juce::ChildProcessWorker* PluginManager::createAudioPluginScannerWorker()
+{
+    return new PluginScannerWorker();
+}
+
+PluginScanner* PluginManager::createAudioPluginScanner()
+{
+    auto* scanner = new PluginScanner (*this);
+    return scanner;
+}
+
+PluginScanner* PluginManager::getBackgroundAudioPluginScanner()
+{
+    if (! priv)
+        return nullptr;
+
+    if (! priv->scanner)
+    {
+        priv->scanner.reset (createAudioPluginScanner());
+        priv->scanner->addListener (priv.get());
+    }
+
+    return priv->scanner.get();
+}
+
+bool PluginManager::isScanningAudioPlugins()
+{
+    return (priv && priv->scanner) ? priv->scanner->isScanning()
+                                   : false;
+}
+
+void PluginManager::stopScanningAudioPlugins (int timeoutMs)
+{
+    if (priv != nullptr && priv->scanner != nullptr && priv->scanner->isScanning())
+    {
+        priv->scanner->cancel();
+        priv->scanner->waitForScanToFinish (timeoutMs);
+    }
+}
+
+AudioPluginInstance* PluginManager::createAudioPlugin (const PluginDescription& desc, String& errorMsg)
+{
+    return getAudioPluginFormats().createPluginInstance (
+                                      desc, priv->sampleRate, priv->blockSize, errorMsg)
+        .release();
+}
+
+Processor* PluginManager::createGraphNode (const PluginDescription& desc, String& errorMsg)
+{
+    errorMsg.clear();
+    auto& nodes = getNodeFactory();
+    if (auto* const plugin = createAudioPlugin (desc, errorMsg))
+    {
+        plugin->enableAllBuses();
+        return NodeFactory::wrap (plugin);
+    }
+
+    if (desc.pluginFormatName == "Internal")
+    {
+        errorMsg.clear();
+        if (desc.fileOrIdentifier == "audio.input")
+            return new IONode (IONode::audioInputNode);
+        else if (desc.fileOrIdentifier == "audio.output")
+            return new IONode (IONode::audioOutputNode);
+        else if (desc.fileOrIdentifier == "midi.input")
+            return new IONode (IONode::midiInputNode);
+        else if (desc.fileOrIdentifier == "midi.output")
+            return new IONode (IONode::midiOutputNode);
+        else
+        {
+            errorMsg = "Could not create internal node";
+            errorMsg << ": " << desc.fileOrIdentifier;
+            return nullptr;
+        }
+    }
+
+    errorMsg.clear();
+    if (! isAudioPluginFormatSupported (desc.pluginFormatName))
+    {
+        errorMsg = desc.name;
+        errorMsg << ": invalid format: " << desc.pluginFormatName;
+        return nullptr;
+    }
+
+    if (auto* node = nodes.instantiate (desc))
+        return node;
+
+    errorMsg = desc.name;
+    errorMsg << " not found.";
+    return nullptr;
+}
+
+AudioPluginFormatManager& PluginManager::getAudioPluginFormats()
+{
+    return priv->formats;
+}
+
+bool PluginManager::isAudioPluginFormatSupported (const String& name) const
+{
+    auto& fmts = priv->formats;
+    for (int i = 0; i < fmts.getNumFormats(); ++i)
+        if (fmts.getFormat (i)->getName() == name)
+            return true;
+    auto& nodes = priv->nodes;
+    for (const auto* provider : nodes.providers())
+        if (provider->format() == name)
+            return true;
+    return false;
+}
+
+AudioPluginFormat* PluginManager::getAudioPluginFormat (const String& name) const
+{
+    auto& manager = priv->formats;
+    for (int i = 0; i < manager.getNumFormats(); ++i)
+    {
+        AudioPluginFormat* fmt = manager.getFormat (i);
+        if (fmt && fmt->getName() == name)
+            return fmt;
+    }
+
+    return nullptr;
+}
+
+KnownPluginList& PluginManager::getKnownPlugins() { return priv->allPlugins; }
+const KnownPluginList& PluginManager::getKnownPlugins() const { return priv->allPlugins; }
+const File& PluginManager::getDeadAudioPluginsFile() const { return priv->deadAudioPlugins; }
+
+void PluginManager::saveUserPlugins (ApplicationProperties& settings)
+{
+    setPropertiesFile (settings.getUserSettings());
+    if (auto elm = priv->allPlugins.createXml())
+        elm->writeTo (detail::pluginsXmlFile());
+}
+
+void PluginManager::restoreUserPlugins (ApplicationProperties& settings)
+{
+    setPropertiesFile (settings.getUserSettings());
+    if (props == nullptr)
+        return;
+
+    // transfer old plugins to new.
+    if (auto xml = props->getXmlValue (detail::pluginListKey()))
+    {
+        xml->writeTo (detail::pluginsXmlFile());
+        props->removeValue (detail::pluginListKey());
+    }
+
+    if (auto xml = XmlDocument::parse (detail::pluginsXmlFile()))
+        restoreUserPlugins (*xml);
+    settings.saveIfNeeded();
+}
+
+void PluginManager::restoreUserPlugins (const XmlElement& xml)
+{
+    priv->allPlugins.recreateFromXml (xml);
+    scanInternalPlugins();
+    priv->updateBlacklistedAudioPlugins();
+    priv->loadPluginMetadata (detail::pluginMetadataXmlFile());
+    if (props == nullptr)
+        return;
+}
+
+void PluginManager::setPlayConfig (double sampleRate, int blockSize)
+{
+    priv->sampleRate = sampleRate;
+    priv->blockSize = blockSize;
+}
+
+void PluginManager::scanAudioPlugins (const StringArray& names)
+{
+    if (! priv)
+        return;
+
+    scanInternalPlugins();
+
+    if (isScanningAudioPlugins())
+        return;
+
+    priv->scanAudioPlugins (names);
+}
+
+String PluginManager::getCurrentlyScannedPluginName() const
+{
+    return (priv) ? priv->getScannedPluginName() : String();
+}
+
+void PluginManager::scanInternalPlugins()
+{
+    auto& nodes = priv->nodes;
+
+    auto& known = getKnownPlugins();
+    const auto types = known.getTypes();
+    for (const auto& t : types)
+    {
+        if (t.pluginFormatName != EL_NODE_FORMAT_NAME)
+            continue;
+        known.removeType (t);
+        known.removeFromBlacklist (t.fileOrIdentifier);
+        known.removeFromBlacklist (t.createIdentifierString());
+    }
+
+    OwnedArray<PluginDescription> ds;
+    for (const auto& nodeTypeId : nodes.knownIDs())
+    {
+        nodes.getPluginDescriptions (ds, nodeTypeId);
+    }
+    for (const auto* const d : ds)
+    {
+        known.removeType (*d);
+        known.removeFromBlacklist (d->fileOrIdentifier);
+        known.removeFromBlacklist (d->createIdentifierString());
+        known.addType (*d);
+    }
+}
+
+void PluginManager::getUnverifiedPlugins (const String& formatName, OwnedArray<PluginDescription>& plugins)
+{
+    priv->getUnverifiedPlugins (formatName, plugins);
+    if (plugins.isEmpty())
+        priv->searchUnverifiedPlugins (props);
+}
+
+void PluginManager::scanFinished()
+{
+    // this file is deprecated and should just be removed.
+    if (PluginScanner::getWorkerPluginListFile().existsAsFile())
+        PluginScanner::getWorkerPluginListFile().deleteFile();
+    sendChangeMessage();
+}
+
+void PluginManager::restoreAudioPlugins (const File& file)
+{
+    if (auto xml = XmlDocument::parse (file))
+        restoreUserPlugins (*xml);
+}
+
+const File& PluginScanner::getWorkerPluginListFile()
+{
+    static File _listTempFile;
+#if 0
+    if (_listTempFile == File())
+        _listTempFile = File::createTempFile ("el-pm-worker");
+#else
+    if (_listTempFile == File())
+        _listTempFile = DataPath::applicationDataDir().getChildFile (EL_PLUGIN_SCANNER_SLAVE_LIST_PATH);
+#endif
+    return _listTempFile;
+}
+
+PluginDescription PluginManager::findDescriptionFor (const Node& node) const
+{
+    PluginDescription desc;
+
+    const String identifierString (node.getProperty (tags::pluginIdentifierString).toString());
+    bool wasFound = false;
+
+    if (identifierString.isNotEmpty())
+    {
+        // fastest, find by identifer string in known plugins
+        if (const auto type = getKnownPlugins().getTypeForIdentifierString (
+                node.getProperty (tags::pluginIdentifierString).toString()))
+        {
+            desc = *type;
+            wasFound = true;
+        }
+    }
+
+    if (! wasFound)
+    {
+        // Manually load and search
+        desc.pluginFormatName = node.getProperty (tags::format).toString();
+        desc.fileOrIdentifier = node.getProperty (tags::identifier).toString();
+
+        OwnedArray<PluginDescription> types;
+        if (auto* format = getAudioPluginFormat (desc.pluginFormatName))
+            format->findAllTypesForFile (types, desc.fileOrIdentifier);
+        if (! types.isEmpty())
+        {
+            desc = *types.getFirst();
+            wasFound = true;
+        }
+    }
+
+    if (! wasFound)
+    {
+        // last resort
+        node.getPluginDescription (desc);
+    }
+
+    return desc;
+}
+
+void PluginManager::saveDefaultNode (const Node& node)
+{
+    if (! node.isValid())
+        return;
+    auto desc = findDescriptionFor (node);
+    auto file = DataPath::applicationDataDir().getChildFile ("nodes");
+    file = file.getChildFile (desc.createIdentifierString());
+    file.createDirectory();
+    file = file.getChildFile ("default.eln");
+    node.writeToFile (file);
+}
+
+Node PluginManager::getDefaultNode (const PluginDescription& desc) const
+{
+    auto file = DataPath::applicationDataDir().getChildFile ("nodes");
+    file = file.getChildFile (desc.createIdentifierString());
+    file = file.getChildFile ("default.eln");
+    if (! file.existsAsFile())
+        return Node();
+    auto data = Node::parse (file);
+    auto node = Node (Node::resetIds (data), false);
+    Node::sanitizeProperties (data);
+    data.removeProperty (tags::name, nullptr);
+    return node;
+}
+
+NodeProvider* PluginManager::getProvider (const String& format) noexcept
+{
+    for (auto provider : getNodeFactory().providers())
+        if (provider->format() == format)
+            return provider;
+    return nullptr;
+}
+
+//==============================================================================
+bool PluginManager::isPluginHidden (const PluginDescription& desc) const
+{
+    return priv->hiddenPlugins.contains (desc.createIdentifierString());
+}
+
+void PluginManager::setPluginHidden (const PluginDescription& desc, bool hidden)
+{
+    const auto id = desc.createIdentifierString();
+    if (hidden)
+        priv->hiddenPlugins.addIfNotAlreadyThere (id);
+    else
+        priv->hiddenPlugins.removeString (id);
+    priv->savePluginMetadata (detail::pluginMetadataXmlFile());
+    priv->allPlugins.sendChangeMessage();
+}
+
+bool PluginManager::isPluginFavorite (const PluginDescription& desc) const
+{
+    return priv->favoritePlugins.contains (desc.createIdentifierString());
+}
+
+void PluginManager::setPluginFavorite (const PluginDescription& desc, bool favorite)
+{
+    const auto id = desc.createIdentifierString();
+    if (favorite)
+        priv->favoritePlugins.addIfNotAlreadyThere (id);
+    else
+        priv->favoritePlugins.removeString (id);
+    priv->savePluginMetadata (detail::pluginMetadataXmlFile());
+    priv->allPlugins.sendChangeMessage();
+}
+
+Array<PluginDescription> PluginManager::getVisiblePluginTypes() const
+{
+    Array<PluginDescription> result;
+    for (const auto& desc : priv->allPlugins.getTypes())
+        if (! priv->hiddenPlugins.contains (desc.createIdentifierString()))
+            result.add (desc);
+    return result;
+}
+
+Array<PluginDescription> PluginManager::getFavoritePluginTypes() const
+{
+    Array<PluginDescription> result;
+    for (const auto& desc : priv->allPlugins.getTypes())
+    {
+        const auto id = desc.createIdentifierString();
+        if (priv->favoritePlugins.contains (id) && ! priv->hiddenPlugins.contains (id))
+            result.add (desc);
+    }
+    return result;
+}
+
+} // namespace element

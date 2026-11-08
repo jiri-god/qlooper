@@ -1,0 +1,1101 @@
+// Copyright 2023 Kushview, LLC <info@kushview.net>
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include <iomanip>
+#include <algorithm>
+#include <limits>
+
+#include <element/audioengine.hpp>
+#include <element/midipipe.hpp>
+#include <element/processor.hpp>
+#include <element/node.hpp>
+
+#include "nodes/audioprocessor.hpp"
+#include "nodes/mididevice.hpp"
+#include "nodes/placeholder.hpp"
+#include "engine/rootgraph.hpp"
+
+namespace element {
+
+Processor::Processor (const PortList& portList)
+    : nodeId (0),
+      isPrepared (false),
+      enablement (*this),
+      midiProgramLoader (*this),
+      portResetter (*this)
+{
+    parent = nullptr;
+    gain.set (1.0f);
+    lastGain.set (1.0f);
+    inputGain.set (1.0f);
+    lastInputGain.set (1.0f);
+    oversampler = std::make_unique<Oversampler<float>>();
+    // ports = portList;
+    setPorts (portList);
+}
+
+Processor::Processor (const uint32 nodeId_) noexcept
+    : nodeId (nodeId_),
+      isPrepared (false),
+      enablement (*this),
+      midiProgramLoader (*this),
+      portResetter (*this)
+{
+    parent = nullptr;
+    gain.set (1.0f);
+    lastGain.set (1.0f);
+    inputGain.set (1.0f);
+    lastInputGain.set (1.0f);
+    oversampler = std::make_unique<Oversampler<float>>();
+}
+
+Processor::~Processor()
+{
+    clearParameters();
+    enablement.cancelPendingUpdate();
+    parent = nullptr;
+}
+
+void Processor::setRenderDetails (double newSampleRate, int newBlockSize)
+{
+    sampleRate = newSampleRate;
+    blockSize = newBlockSize;
+}
+
+void Processor::clearParameters()
+{
+#if JUCE_DEBUG
+    for (const auto* param : parameters)
+        jassert (param->getReferenceCount() >= 1);
+#endif
+    parameters.clear();
+}
+
+bool Processor::isSpecialParameter (int parameter)
+{
+    return parameter >= SpecialParameterBegin && parameter < SpecialParameterEnd;
+}
+
+String Processor::getSpecialParameterName (int parameter)
+{
+    String name = "N/A";
+
+    switch (parameter)
+    {
+        case NoParameter:
+            name = "None";
+            break;
+        case EnabledParameter:
+            name = "Enable/Disable";
+            break;
+        case BypassParameter:
+            name = "Bypass";
+            break;
+        case MuteParameter:
+            name = "Mute";
+            break;
+        case InputGainParameter:
+            name = "Input Gain";
+            break;
+        case OutputGainParameter:
+            name = "Output Gain";
+            break;
+    }
+
+    return name;
+}
+
+const String Processor::getTypeString() const noexcept
+{
+    return isA<GraphNode>() ? types::Graph.toString()
+                            : tags::plugin.toString();
+}
+
+bool Processor::containsParameter (const int index) const
+{
+    const auto numParams = getNumPorts (PortType::Control, true);
+    return (index >= SpecialParameterBegin && index < SpecialParameterEnd) || (isPositiveAndBelow (index, numParams));
+}
+
+void Processor::setInputGain (const float f)
+{
+    if (f == inputGain.get())
+        return;
+    inputGain.set (f);
+    inputGainChanged (this);
+}
+
+void Processor::setGain (const float f)
+{
+    if (f == gain.get())
+        return;
+    gain.set (f);
+    gainChanged (this);
+}
+
+void Processor::getPluginDescription (PluginDescription& desc) const
+{
+    if (AudioPluginInstance* i = getAudioPluginInstance())
+    {
+        i->fillInPluginDescription (desc);
+    }
+    else
+    {
+        // need to fill this in for custom nodes
+        jassertfalse;
+    }
+}
+
+void Processor::connectAudioTo (const Processor* other)
+{
+    jassert (getParentGraph());
+    jassert (getParentGraph() == other->getParentGraph());
+
+    auto& graph (*getParentGraph());
+    AudioPluginInstance* const src = getAudioPluginInstance();
+    AudioPluginInstance* const dst = other->getAudioPluginInstance();
+    ignoreUnused (src, dst);
+    const int totalChans = jmin (getNumAudioOutputs(), other->getNumAudioInputs());
+    int failed = 0;
+
+    for (int chan = 0; chan < totalChans; ++chan)
+    {
+        if (! graph.addConnection (
+                this->nodeId, getPortForChannel (PortType::Audio, chan, false), other->nodeId, other->getPortForChannel (PortType::Audio, chan, true)))
+        {
+            ++failed;
+        }
+    }
+
+    if (failed > 0)
+    {
+        DBG ("[element] failed connecting audio from " << src->getName() << " to " << dst->getName());
+    }
+}
+
+bool Processor::isAudioInputNode() const
+{
+    if (auto* iop = dynamic_cast<const IONode*> (this))
+        return iop->getType() == IONode::audioInputNode;
+    return false;
+}
+
+bool Processor::isAudioOutputNode() const
+{
+    if (auto* iop = dynamic_cast<const IONode*> (this))
+        return iop->getType() == IONode::audioOutputNode;
+    return false;
+}
+
+bool Processor::isAudioIONode() const
+{
+    return isAudioInputNode() || isAudioOutputNode();
+}
+
+bool Processor::isMidiIONode() const
+{
+    if (auto* iop = dynamic_cast<const IONode*> (this))
+        return iop->getType() == IONode::midiInputNode || iop->getType() == IONode::midiOutputNode;
+    return false;
+}
+
+bool Processor::isMidiDeviceNode() const
+{
+    return nullptr != dynamic_cast<MidiDeviceProcessor*> (getAudioProcessor());
+}
+
+int Processor::getNumAudioInputs() const { return ports.size (PortType::Audio, true); }
+int Processor::getNumAudioOutputs() const { return ports.size (PortType::Audio, false); }
+
+void Processor::updateRMSMeter (RMSMeter& meter, float blockRMS, int numSamples)
+{
+    // Integrate the block mean-square with a one-pole filter whose coefficient
+    // scales with the block length. This yields a fixed integration window
+    // regardless of the host buffer size, so the metered level (and its
+    // ballistics) no longer change when the audio device block size changes.
+    static constexpr double integrationSeconds = 0.3;
+
+    if (numSamples <= 0)
+        return;
+
+    const double fs = sampleRate > 0.0 ? sampleRate : 44100.0;
+    const float ms = blockRMS * blockRMS;
+    const float alpha = (float) (1.0 - std::exp (-(double) numSamples / (integrationSeconds * fs)));
+    meter.meanSquare += (ms - meter.meanSquare) * alpha;
+    meter.value.set (std::sqrt (meter.meanSquare));
+}
+
+void Processor::setInputRMS (int chan, float rms, int numSamples)
+{
+    if (chan < inRMS.size())
+        updateRMSMeter (*inRMS.getUnchecked (chan), rms, numSamples);
+}
+
+void Processor::setOutputRMS (int chan, float rms, int numSamples)
+{
+    if (chan < outRMS.size())
+        updateRMSMeter (*outRMS.getUnchecked (chan), rms, numSamples);
+}
+
+bool Processor::isSuspended() const
+{
+    return bypassed.get() == 1;
+}
+
+void Processor::suspendProcessing (const bool shouldBeSuspended)
+{
+    const bool wasSuspeneded = isSuspended();
+    const int iShouldBeSuspended = static_cast<int> (shouldBeSuspended);
+
+    if (auto* proc = getAudioProcessor())
+    {
+        if (wasSuspeneded != shouldBeSuspended)
+        {
+            proc->suspendProcessing (shouldBeSuspended);
+            bypassed.set (proc->isSuspended() ? 1 : 0);
+        }
+    }
+    else if (bypassed.get() != iShouldBeSuspended)
+    {
+        bypassed.set (iShouldBeSuspended);
+    }
+
+    if (isSuspended() != wasSuspeneded)
+        bypassChanged (this);
+}
+
+bool Processor::isGraph() const noexcept { return isA<GraphNode>(); }
+bool Processor::isRootGraph() const noexcept { return isA<RootGraph>(); }
+bool Processor::isSubGraph() const noexcept { return isGraph() && ! isRootGraph(); }
+
+PortType Processor::getPortType (const uint32 port) const
+{
+    const PortType t (ports.getType (static_cast<int> (port)));
+    return t;
+}
+
+int Processor::getNumPorts (const PortType type, const bool isInput) const { return ports.size (type, isInput); }
+uint32 Processor::getNumPorts() const { return (uint32) ports.size(); }
+
+PortDescription Processor::getPort (int index) const
+{
+    auto port = ports.getPort (index);
+    jassert (index == port.index);
+    return port;
+}
+
+bool Processor::isPortInput (const uint32 port) const
+{
+    jassert (port < getNumPorts());
+    return ports.isInput (static_cast<int> (port), false);
+}
+
+bool Processor::isPortOutput (const uint32 port) const
+{
+    jassert (port < getNumPorts());
+    return ports.isOutput (static_cast<int> (port), true);
+}
+
+uint32 Processor::getPortForChannel (const PortType type, const int channel, const bool isInput) const
+{
+    return static_cast<uint32> (ports.getPortForChannel (type, channel, isInput));
+}
+
+int Processor::getChannelPort (const uint32 port) const
+{
+    return ports.getChannelForPort (static_cast<int> (port));
+}
+
+int Processor::getNthPort (const PortType type, const int index, bool isInput, bool oneBased) const
+{
+    int count = oneBased ? 0 : -1;
+
+    jassert (getNumPorts() >= 0);
+    uint32 nports = getNumPorts();
+
+    for (uint32 port = 0; port < nports; ++port)
+    {
+        if (type == getPortType (port) && isInput == isPortInput (port))
+        {
+            if (++count == index)
+            {
+                return port;
+            }
+        }
+    }
+
+    jassertfalse;
+    return EL_INVALID_PORT;
+}
+
+uint32 Processor::getMidiInputPort() const { return getPortForChannel (PortType::Midi, 0, true); }
+uint32 Processor::getMidiOutputPort() const { return getPortForChannel (PortType::Midi, 0, false); }
+
+juce::Optional<juce::AudioPlayHead::PositionInfo> Processor::ScaledPlayHead::getPosition() const
+{
+    auto* source = processor._playhead;
+    auto position = source != nullptr ? source->getPosition() : juce::nullopt;
+    if (position.hasValue())
+        if (const auto samples = position->getTimeInSamples())
+        {
+            const auto factor = int64_t (processor.processingFactor.load());
+            position->setTimeInSamples (std::clamp (int64_t (*samples),
+                                                    std::numeric_limits<int64_t>::min() / factor,
+                                                    std::numeric_limits<int64_t>::max() / factor) * factor);
+        }
+    return position;
+}
+
+void Processor::prepare (const double newSampleRate,
+                         const int newBlockSize,
+                         GraphNode* const parentGraph,
+                         bool willBeEnabled)
+{
+    sampleRate = newSampleRate;
+    blockSize = newBlockSize;
+    parent = parentGraph;
+    updateDelayCompensationSamples();
+
+    if ((willBeEnabled || enabled.get() == 1) && ! isPrepared)
+    {
+        isPrepared = true;
+        setParentGraph (parentGraph); //<< ensures io nodes get setup
+
+        oversampler->prepare (jmax (getNumPorts (PortType::Audio, true),
+                                    getNumPorts (PortType::Audio, false)),
+                              blockSize);
+        if (osPow > 0)
+            oversampler->ensureProcessor (osPow - 1);
+
+        if (auto* const osProc = getOversamplingProcessor())
+            osLatency = osProc->getLatencyInSamples();
+        else
+            osLatency = 0.0f;
+
+        const int osFactor = jmax (1, getOversamplingFactor());
+        processingFactor.store (osFactor);
+        prepareToRender (sampleRate * osFactor, blockSize * osFactor);
+
+        inRMS.clearQuick (true);
+        for (int i = 0; i < getNumAudioInputs(); ++i)
+            inRMS.add (new RMSMeter());
+
+        outRMS.clearQuick (true);
+        for (int i = 0; i < getNumAudioOutputs(); ++i)
+            outRMS.add (new RMSMeter());
+        renderUsers.store (0);
+    }
+}
+
+void Processor::closeRenderAdmission()
+{
+    renderUsers.fetch_or (renderClosed);
+    // The control/device lifecycle thread waits, never the audio callback.
+    while ((renderUsers.load() & ~renderClosed) != 0)
+        Thread::sleep (1);
+}
+
+void Processor::unprepare()
+{
+    closeRenderAdmission();
+    if (isPrepared)
+    {
+        isPrepared = false;
+        releaseResources();
+        oversampler->reset();
+        inRMS.clear (true);
+        outRMS.clear (true);
+    }
+}
+
+void Processor::setEnabled (const bool shouldBeEnabled)
+{
+    requestedEnabled.store (shouldBeEnabled);
+    if (! MessageManager::getInstance()->isThisTheMessageThread())
+    {
+        enablement.cancelPendingUpdate();
+        enablement.triggerAsyncUpdate();
+        return;
+    }
+
+    applyEnabled (requestedEnabled.load());
+}
+
+void Processor::applyEnabled (bool shouldBeEnabled)
+{
+    jassert (MessageManager::getInstance()->isThisTheMessageThread());
+    if (shouldBeEnabled == isEnabled())
+        return;
+
+    if (shouldBeEnabled)
+    {
+        if (parent)
+        {
+            prepare (parent->getSampleRate(), parent->getBlockSize(), parent, true);
+            enabled.set (1);
+        }
+        else
+        {
+            enabled.set (0);
+        }
+    }
+    else
+    {
+        enabled.set (0);
+        unprepare();
+    }
+
+    enablementChanged (this);
+}
+
+void Processor::EnablementUpdater::handleAsyncUpdate()
+{
+    if (const int factor = graph.requestedOversampling.exchange (0))
+        graph.applyOversamplingFactor (factor);
+    graph.applyEnabled (graph.requestedEnabled.load());
+}
+
+//=============================================================================
+
+void Processor::reloadMidiProgram()
+{
+    midiProgramLoader.triggerAsyncUpdate();
+}
+
+File Processor::getMidiProgramFile (int program) const
+{
+    PluginDescription desc;
+    getPluginDescription (desc);
+    const auto uids = desc.createIdentifierString();
+    if (! isPositiveAndBelow (program, 128))
+        program = getMidiProgram();
+
+    if (uids.isEmpty())
+    {
+        jassertfalse;
+        return File();
+    }
+
+    if (! isPositiveAndBelow (program, 128))
+    {
+        jassertfalse;
+        return File();
+    }
+
+    std::stringstream stream;
+    stream << uids.toStdString() << "_" << std::setfill ('0') << std::setw (3) << program << ".eln";
+    String fileName = stream.str();
+    const File file (DataPath::defaultGlobalMidiProgramsDir().getChildFile (fileName));
+    if (! file.getParentDirectory().exists())
+        file.getParentDirectory().createDirectory();
+    return file;
+}
+
+void Processor::saveMidiProgram()
+{
+    saveMidiProgram (midiProgram.get());
+}
+
+void Processor::saveMidiProgram (int program)
+{
+    if (useGlobalMidiPrograms())
+        return; // don't save global programs here.
+
+    if (! isPositiveAndBelow (program, 128))
+        return;
+    if (auto* const pr = getMidiProgram (program))
+    {
+        pr->state = MemoryBlock();
+        getState (pr->state);
+    }
+}
+
+int Processor::nextAvailableMidiProgram (int after) const
+{
+    bool used[128] = { false };
+    for (const auto& info : getMidiPrograms())
+        if (isPositiveAndBelow (info.program, 128))
+            used[info.program] = true;
+
+    for (int i = 1; i <= 128; ++i)
+    {
+        const int candidate = (after + i) % 128;
+        if (! used[candidate])
+            return candidate;
+    }
+
+    return -1; // all 128 slots occupied.
+}
+
+void Processor::removeMidiProgram (int program, bool global)
+{
+    if (! isPositiveAndBelow (program, 128))
+        return;
+
+    if (global)
+    {
+        const auto file = getMidiProgramFile (program);
+        if (file.existsAsFile())
+            file.deleteFile();
+    }
+    else
+    {
+        for (int i = midiPrograms.size(); --i >= 0;)
+        {
+            auto* const progobj = midiPrograms.getUnchecked (i);
+            if (progobj->program == program)
+                midiPrograms.remove (i);
+        }
+    }
+}
+
+Processor::MidiProgram* Processor::getMidiProgram (int program) const
+{
+    if (! isPositiveAndBelow (program, 128))
+        return nullptr;
+    for (auto* const p : midiPrograms)
+        if (p->program == program)
+            return p;
+    auto* const ret = midiPrograms.add (new Processor::MidiProgram());
+    ret->program = program;
+    return ret;
+}
+
+Array<Processor::MidiProgramInfo> Processor::getMidiPrograms() const
+{
+    Array<MidiProgramInfo> result;
+
+    if (useGlobalMidiPrograms())
+    {
+        PluginDescription desc;
+        getPluginDescription (desc);
+        const auto uids = desc.createIdentifierString();
+        if (uids.isEmpty())
+            return result;
+
+        const auto dir = DataPath::defaultGlobalMidiProgramsDir();
+        for (const auto& file : dir.findChildFiles (File::findFiles, false, uids + "_*.eln"))
+        {
+            // Filenames are "<uids>_<NNN>.eln"; parse the trailing program index.
+            const auto index = file.getFileNameWithoutExtension()
+                                   .fromLastOccurrenceOf ("_", false, false)
+                                   .getIntValue();
+            if (isPositiveAndBelow (index, 128))
+            {
+                String name ("Global ");
+                name << (index + 1);
+                result.add ({ index, name });
+            }
+        }
+    }
+    else
+    {
+        // Only include programs that actually have saved state. Reading a
+        // program name elsewhere can find-or-create empty placeholder entries.
+        for (auto* const p : midiPrograms)
+            if (p->state.getSize() > 0)
+                result.add ({ p->program, p->name });
+    }
+
+    std::sort (result.begin(), result.end(), [] (const MidiProgramInfo& a, const MidiProgramInfo& b) {
+        return a.program < b.program;
+    });
+
+    return result;
+}
+
+void Processor::MidiProgramLoader::handleAsyncUpdate()
+{
+    const File programFile = node.getMidiProgramFile();
+    const bool globalPrograms = node.useGlobalMidiPrograms();
+    const auto requestedProgram = node.getMidiProgram();
+
+    if (globalPrograms)
+    {
+        if (programFile.existsAsFile())
+        {
+            const auto programData = Node::parse (programFile);
+            auto data = programData.getProperty (tags::state).toString().trim();
+            if (data.isNotEmpty())
+            {
+                MemoryBlock state;
+                state.fromBase64Encoding (data);
+                if (state.getSize() > 0)
+                {
+                    node.lastMidiProgram.set (requestedProgram);
+                    node.setState (state.getData(), (int) state.getSize());
+                    DBG ("[element] loaded program: " << requestedProgram);
+                }
+            }
+        }
+        else
+        {
+            DBG ("[element] Program file doesn't exist: " << node.getMidiProgramFile().getFileName());
+        }
+    }
+    else
+    {
+        if (auto* const program = node.getMidiProgram (requestedProgram))
+        {
+            node.setState (program->state.getData(),
+                           static_cast<int> (program->state.getSize()));
+        }
+        else
+        {
+            DBG ("[element] program has no data");
+        }
+    }
+
+    // always notify the program # changed even if not loaded.
+    // do this because there may not be data for the program but
+    // the property is still relavent.
+    node.midiProgramChanged();
+}
+
+void Processor::setMidiProgram (const int program)
+{
+    if (program < 0 || program > 127)
+    {
+        jassertfalse; // out of range
+        return;
+    }
+
+    midiProgram.set (program);
+}
+
+void Processor::setMidiProgramName (const int program, const String& name)
+{
+    if (useGlobalMidiPrograms())
+        return; // names not supported with global programs yet.
+
+    if (auto* pr = getMidiProgram (program))
+        pr->name = name;
+}
+
+bool Processor::changeMidiProgramNumber (int from, int to)
+{
+    if (useGlobalMidiPrograms())
+        return false; // renumbering not supported for global programs.
+    if (! isPositiveAndBelow (from, 128) || ! isPositiveAndBelow (to, 128))
+        return false;
+    if (from == to)
+        return true;
+
+    MidiProgram* source = nullptr;
+    for (auto* const p : midiPrograms)
+    {
+        if (p->program == to && p->state.getSize() > 0)
+            return false; // target slot already has a saved program.
+        if (p->program == from)
+            source = p;
+    }
+
+    if (source == nullptr || source->state.getSize() == 0)
+        return false; // nothing saved to move.
+
+    // Drop any empty placeholder occupying the destination.
+    for (int i = midiPrograms.size(); --i >= 0;)
+    {
+        auto* const p = midiPrograms.getUnchecked (i);
+        if (p != source && p->program == to)
+            midiPrograms.remove (i);
+    }
+
+    source->program = to;
+
+    if (midiProgram.get() == from)
+        midiProgram.set (to);
+
+    return true;
+}
+
+String Processor::getMidiProgramName (const int program) const
+{
+    if (useGlobalMidiPrograms())
+    {
+        String name ("Global ");
+        name << (program + 1);
+        return name;
+    }
+
+    if (auto* pr = getMidiProgram (program))
+        return pr->name;
+    return {};
+}
+
+void Processor::getMidiProgramsState (String& state) const
+{
+    state = String();
+    if (midiPrograms.size() <= 0)
+        return;
+    ValueTree tree ("programs");
+    for (auto* const program : midiPrograms)
+    {
+        auto& state = program->state;
+        ValueTree data ("program");
+        data.setProperty (tags::program, program->program, nullptr)
+            .setProperty (tags::name, program->name, nullptr)
+            .setProperty (tags::state, state.toBase64Encoding(), nullptr);
+        tree.appendChild (data, nullptr);
+    }
+
+    MemoryOutputStream mo;
+    {
+        GZIPCompressorOutputStream gzipStream (mo, 9);
+        tree.writeToStream (gzipStream);
+    }
+
+    state = mo.getMemoryBlock().toBase64Encoding();
+}
+
+void Processor::setMidiProgramsState (const String& state)
+{
+    midiPrograms.clearQuick (true);
+    if (state.isEmpty())
+        return;
+    MemoryBlock mb;
+    mb.fromBase64Encoding (state);
+    const ValueTree tree = (mb.getSize() > 0)
+                               ? ValueTree::readFromGZIPData (mb.getData(), mb.getSize())
+                               : ValueTree();
+
+    for (int i = 0; i < tree.getNumChildren(); ++i)
+    {
+        const auto data = tree.getChild (i);
+        std::unique_ptr<Processor::MidiProgram> program;
+        program.reset (new Processor::MidiProgram());
+        program->program = (int) data[tags::program];
+        program->name = data[tags::name].toString();
+        const auto state = data.getProperty (tags::state).toString().trim();
+        if (state.isNotEmpty() && isPositiveAndBelow (program->program, 128))
+        {
+            program->state.fromBase64Encoding (state);
+            midiPrograms.add (program.release());
+        }
+    }
+}
+
+//=============================================================================
+void Processor::renderBypassed (RenderContext& rc)
+{
+    const auto numSamples = rc.audio.getNumSamples();
+    rc.audio.clear (0, numSamples);
+    rc.cv.clear (0, numSamples);
+    rc.midi.clear (0, numSamples);
+}
+
+//=============================================================================
+void Processor::setPorts (const PortList& newPorts)
+{
+    ports = newPorts;
+
+    // clang-format off
+    if (ports.size (PortType::Midi, true) <= 0 &&
+         ports.size (PortType::Atom, true) <= 0 && 
+        ! isMidiIONode() && ! isAudioIONode() && 
+        ! isMidiDeviceNode() && ! isRootGraph())
+    // clang-format on
+    {
+        ports.add (PortType::Midi, ports.size(), 0, "element_midi_input", "MIDI In", true);
+    }
+
+    ParameterArray newParams, newParamsOut;
+    for (const auto* port : ports)
+    {
+        auto& parr = port->input ? newParams : newParamsOut;
+        if (port->type == PortType::Control)
+            parr.add (getOrCreateParameter (*port));
+    }
+
+    struct SortByArrayIndex
+    {
+        int compareElements (Parameter* lhs, Parameter* rhs)
+        {
+            return lhs->getParameterIndex() < rhs->getParameterIndex() ? -1 : 1;
+        }
+    } sorter;
+
+    newParams.sort (sorter, true);
+    parameters.swapWith (newParams);
+    newParamsOut.sort (sorter, true);
+    parametersOut.swapWith (newParamsOut);
+
+    // Keep the RMS metering buffers in sync with the (possibly changed) channel
+    // counts. prepare() sizes these once, but an IO node's channel count can grow
+    // later (e.g. raising a graph's Audio Out count via the +/- controls), which
+    // refreshes ports without re-preparing. Grow-only: never drop a slot the audio
+    // or UI threads may still be reading.
+    if (isPrepared)
+    {
+        for (int i = inRMS.size(); i < getNumAudioInputs(); ++i)
+            inRMS.add (new RMSMeter());
+
+        for (int i = outRMS.size(); i < getNumAudioOutputs(); ++i)
+            outRMS.add (new RMSMeter());
+    }
+}
+
+ValueTree Processor::createPortsData() const
+{
+    ValueTree portList (tags::ports);
+
+    for (int i = 0; i < ports.size(); ++i)
+    {
+        ValueTree port = ports.createValueTree (i);
+        port.setProperty (tags::flow, ports.isInput (i) ? "input" : "output", nullptr);
+        port.removeProperty (tags::input, nullptr);
+        portList.addChild (port, -1, 0);
+        jassert (isPositiveAndBelow ((int) port.getProperty (tags::index), ports.size()));
+    }
+
+    return portList;
+}
+
+void Processor::resetPorts()
+{
+    refreshPorts();
+}
+
+GraphNode* Processor::getParentGraph() const { return parent; }
+
+void Processor::setParentGraph (GraphNode* const graph)
+{
+    parent = graph;
+    if (IONode* const iop = dynamic_cast<IONode*> (this))
+    {
+        iop->setParentGraph (parent);
+        refreshPorts();
+    }
+}
+
+void Processor::setMuted (bool muted)
+{
+    bool wasMuted = isMuted();
+    mute.set (muted ? 1 : 0);
+    if (wasMuted != isMuted())
+        muteChanged (this);
+}
+
+//==============================================================================
+dsp::Oversampling<float>* Processor::getOversamplingProcessor()
+{
+    return osPow > 0 ? oversampler->getProcessor (osPow - 1) : nullptr;
+}
+
+void Processor::setOversamplingFactor (int osFactor)
+{
+    requestedOversampling.store (osFactor);
+    if (! MessageManager::getInstance()->isThisTheMessageThread())
+    {
+        enablement.triggerAsyncUpdate();
+        return;
+    }
+    if (const int factor = requestedOversampling.exchange (0))
+        applyOversamplingFactor (factor);
+}
+
+void Processor::applyOversamplingFactor (int osFactor)
+{
+    jassert (MessageManager::getInstance()->isThisTheMessageThread());
+    // Native transport nodes and section graphs must share their parent's rate.
+    if (! supportsOversampling())
+        osFactor = 1;
+    // Only the supported powers of two are meaningful. Reject invalid input
+    // before converting it to an exponent or changing the running processor.
+    int newOsPow = 0;
+    switch (osFactor)
+    {
+        case 1: break;
+        case 2: newOsPow = 1; break;
+        case 4: newOsPow = 2; break;
+        case 8: newOsPow = 3; break;
+        default: return;
+    }
+
+
+    {
+        ScopedLock sl (getPropertyLock());
+        if (newOsPow == osPow)
+            return;
+    }
+
+    {
+        const auto wasEnabled = isEnabled();
+        applyEnabled (false);
+
+        if (osFactor > 1)
+        {
+            osPow = newOsPow;
+            if (auto* const osProc = getOversamplingProcessor())
+                osLatency = osProc->getLatencyInSamples();
+            else
+                osLatency = 0.0f;
+        }
+        else
+        {
+            osPow = 0;
+            osLatency = 0.0f;
+        }
+
+        applyEnabled (wasEnabled);
+    }
+
+    if (auto* g = getParentGraph())
+        g->triggerAsyncUpdate();
+}
+
+int Processor::getOversamplingFactor()
+{
+    if (osPow > 0)
+    {
+        if (auto* osProc = getOversamplingProcessor())
+            return static_cast<int> (osProc->getOversamplingFactor());
+    }
+
+    return 1;
+}
+
+//==============================================================================
+static int clampLatencySamples (const Processor& proc, int samples, const char* what)
+{
+    if (samples >= 0 && samples <= Processor::maxLatencySamples)
+        return samples;
+    Logger::writeToLog (String ("[element] ") + proc.getName() + ": clamping " + what
+                        + " of " + String (samples) + " samples");
+    return jlimit (0, Processor::maxLatencySamples, samples);
+}
+
+void Processor::setDelayCompensation (double delayMs)
+{
+    delayCompMillis = delayMs;
+    updateDelayCompensationSamples();
+}
+
+void Processor::updateDelayCompensationSamples()
+{
+    // The sample rate may not be known yet (e.g. state restored before
+    // prepare); prepare() calls this again once it is.
+    if (sampleRate <= 0.0)
+        return;
+    delayCompSamples = clampLatencySamples (
+        *this, roundToInt (delayCompMillis * 0.001 * sampleRate), "delay compensation");
+}
+
+double Processor::getDelayCompensation() const { return delayCompMillis; }
+int Processor::getDelayCompensationSamples() const { return delayCompSamples; }
+
+//=========================================================================
+struct ChannelConnectionMap
+{
+    ChannelConnectionMap() {}
+    ~ChannelConnectionMap() {}
+
+    int channel;
+    PortType type { PortType::Unknown };
+    uint32 otherNodeId;
+    uint32 otherNodePort;
+};
+
+void Processor::PortResetter::handleAsyncUpdate()
+{
+    auto* const graph = node.getParentGraph();
+
+    OwnedArray<ChannelConnectionMap> sources, destinations;
+    if (graph != nullptr)
+    {
+        // Cache existing connections by channel.
+        for (int i = graph->getNumConnections(); --i >= 0;)
+        {
+            const auto* const c = graph->getConnection (i);
+            if (c->destNode == node.nodeId)
+            {
+                auto* m = sources.add (new ChannelConnectionMap());
+                m->type = node.getPortType (c->destPort);
+                m->channel = node.getChannelPort (c->destPort);
+                m->otherNodeId = c->sourceNode;
+                m->otherNodePort = c->sourcePort;
+            }
+            else if (c->sourceNode == node.nodeId)
+            {
+                auto* d = destinations.add (new ChannelConnectionMap());
+                d->type = node.getPortType (c->sourcePort);
+                d->channel = node.getChannelPort (c->sourcePort);
+                d->otherNodeId = c->destNode;
+                d->otherNodePort = c->destPort;
+            }
+        }
+    }
+
+    node.refreshPorts();
+
+    if (graph != nullptr)
+    {
+        // Re-apply connections by channel
+        for (const auto* ccs : sources)
+        {
+            graph->addConnection (ccs->otherNodeId, ccs->otherNodePort, node.nodeId, node.getPortForChannel (ccs->type, ccs->channel, true));
+        }
+
+        for (const auto* dss : destinations)
+        {
+            graph->addConnection (node.nodeId, node.getPortForChannel (dss->type, dss->channel, false), dss->otherNodeId, dss->otherNodePort);
+        }
+        graph->removeIllegalConnections();
+    }
+
+    // notify others
+    node.portsChanged();
+    if (auto gn = dynamic_cast<GraphNode*> (&node))
+    {
+        // GraphNode's will likely have IONodes which need to notify as well.
+        for (int i = 0; i < gn->getNumNodes(); ++i)
+            if (auto io = dynamic_cast<IONode*> (gn->getNode (i)))
+                io->portsChanged();
+    }
+}
+
+void Processor::triggerPortReset()
+{
+    portResetter.cancelPendingUpdate();
+    portResetter.triggerAsyncUpdate();
+}
+
+//=========================================================================
+int Processor::getLatencySamples() const
+{
+    // Intrinsic latency is reported in local rendering samples. Manual delay and
+    // the oversampling filter already use parent-rate units and are added once.
+    const auto factor = processingFactor.load();
+    const auto intrinsic = int64_t (latencySamples.load());
+    return int ((intrinsic + factor - 1) / factor) + delayCompSamples + roundToInt (osLatency);
+}
+
+void Processor::setLatencySamples (int latency)
+{
+    latencySamples = clampLatencySamples (*this, latency, "latency");
+}
+
+//=========================================================================
+ParameterPtr Processor::getOrCreateParameter (const PortDescription& port)
+{
+    jassert (port.type == PortType::Control);
+    if (port.type != PortType::Control)
+        return nullptr;
+
+    auto param = getParameter (port);
+
+    if (param == nullptr)
+    {
+        param = new RangedParameter (port);
+    }
+
+    if (param != nullptr)
+    {
+        param->parameterIndex = port.channel;
+    }
+
+    jassert (param != nullptr);
+    return param;
+}
+
+} // namespace element

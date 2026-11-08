@@ -1,0 +1,685 @@
+// Copyright 2023 Kushview, LLC <info@kushview.net>
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#pragma once
+
+#include <element/juce.hpp> // FIXME: namespace juce
+#include <element/juce/core.hpp>
+#include <element/juce/audio_basics.hpp>
+#include <element/juce/audio_processors.hpp>
+
+#include <element/atomic.hpp>
+#include <atomic>
+#include <element/midipipe.hpp>
+#include <element/oversampler.hpp>
+#include <element/parameter.hpp>
+#include <element/portcount.hpp>
+#include <element/midichannels.hpp>
+#include <element/signals.hpp>
+
+namespace element {
+
+/* So render tasks can be friends of graph node */
+namespace GraphRender {
+class ProcessBufferOp;
+}
+
+class Editor;
+class GraphNode;
+class ProcessBufferOp;
+
+struct RenderContext {
+    juce::AudioSampleBuffer audio;
+    juce::AudioSampleBuffer cv;
+    MidiPipe midi;
+
+    // clang-format off
+    RenderContext (float* const *audioData, 
+                   int numAudio,
+                   float* const *cvData, 
+                   int numCV,
+                   const juce::OwnedArray<juce::MidiBuffer>& sharedMidi,
+                   const juce::Array<int>& midiIndexes,
+                   int numSamples)
+        : audio (audioData, numAudio, numSamples),
+          cv (cvData, numCV, numSamples),
+          midi (sharedMidi, midiIndexes)
+    {}
+
+    RenderContext (juce::AudioSampleBuffer& audioRef,
+                   juce::AudioSampleBuffer& cvRef,
+                   juce::MidiBuffer& midiRef,
+                   int numSamples)
+        : audio (audioRef.getArrayOfWritePointers(), audioRef.getNumChannels(), numSamples), 
+          cv (cvRef.getArrayOfWritePointers(), cvRef.getNumChannels(), numSamples),
+          midi (midiRef)
+    {}
+    // clang-format on
+};
+
+class Processor : public juce::ReferenceCountedObject {
+public:
+    /** Special parameter indexes when mapping universal node settings */
+    enum SpecialParameter {
+        NoParameter = -1,
+        EnabledParameter = -2,
+        BypassParameter = -3,
+        MuteParameter = -4,
+        InputGainParameter = -5,
+        OutputGainParameter = -6,
+        SpecialParameterBegin = OutputGainParameter,
+        SpecialParameterEnd = NoParameter
+    };
+
+    /** The ID number assigned to this node. This is assigned by the graph
+        that owns it, and can't be changed. */
+    const uint32 nodeId;
+
+    virtual ~Processor();
+
+    /** Returns true if a parameter index is special */
+    static bool isSpecialParameter (int parameter);
+
+    /** Returns the name of a special parameter */
+    static String getSpecialParameterName (int parameter);
+
+    //=========================================================================
+    /** Returns the name of this node */
+    String getName() const { return name; }
+
+    /** Returns true if this is a T type node */
+    template <class T>
+    bool isA() const
+    {
+        return nullptr != dynamic_cast<const T*> (this);
+    }
+
+    //=========================================================================
+    void setRenderDetails (double newSampleRate, int newBlockSize);
+    double getSampleRate() const noexcept { return sampleRate; }
+    int getBlockSize() const noexcept { return blockSize; }
+
+    //=========================================================================
+    /** Returns an audio processor if available */
+    virtual juce::AudioProcessor* getAudioProcessor() const noexcept { return nullptr; }
+
+    /** The actual processor object dynamic_cast'd to T */
+    template <class T>
+    inline T* processor() const noexcept
+    {
+        return dynamic_cast<T*> (getAudioProcessor());
+    }
+
+    /** Returns the processor as an Audio Plugin Instance */
+    juce::AudioPluginInstance* getAudioPluginInstance() const noexcept { return processor<juce::AudioPluginInstance>(); }
+
+    /** Set the audio play head */
+    virtual void setPlayHead (juce::AudioPlayHead* playhead) { _playhead = playhead; }
+    /** Clock in this processor's rendering sample units. Musical/second fields are unchanged. */
+    juce::AudioPlayHead* getPlayHead() const noexcept { return _playhead != nullptr ? &scaledPlayHead : nullptr; }
+
+    //==========================================================================
+    virtual void prepareToRender (double sampleRate, int maxBufferSize) = 0;
+    virtual void releaseResources() = 0;
+
+    /** Render the buffers. */
+    virtual void render (RenderContext&) {}
+
+    /** Render when bypassed.  The default action is to clear all buffers, so
+        this must also be implemented.
+    */
+    virtual void renderBypassed (RenderContext&);
+
+    /** FIXME: AudioProcessor types access the juce class directly... */
+    virtual bool wantsContext() const noexcept { return true; }
+
+    /** Returns the total number of audio inputs */
+    int getNumAudioInputs() const;
+
+    /** Returns the total number of audio ouputs */
+    int getNumAudioOutputs() const;
+
+    //=========================================================================
+    const ParameterArray& getParameters (bool inputs = true) const noexcept { return inputs ? parameters : parametersOut; }
+    const PatchParameterArray& getPatches() const noexcept { return _patches; }
+
+    ParameterPtr getParameter (int index, bool isInput) const noexcept
+    {
+        return getParameters (isInput)[index];
+    }
+
+    ParameterPtr getParameter (int port)
+    {
+        auto desc = getPort (port);
+        return desc.type == PortType::Control ? getParameter (desc.channel, desc.input)
+                                              : nullptr;
+    }
+
+    //=========================================================================
+    /** Returns the type of port
+        
+        @param port The port to check
+     */
+    PortType getPortType (const uint32 port) const;
+
+    /** Returns the total number of ports on this node */
+    uint32 getNumPorts() const;
+
+    /** Returns a port description by index */
+    PortDescription getPort (int index) const;
+
+    /** Returns the number of ports for a given type and flow */
+    int getNumPorts (const PortType type, const bool isInput) const;
+
+    /** Returns the default MIDI input port */
+    uint32 getMidiInputPort() const;
+
+    /** Returns the default MIDI output port */
+    uint32 getMidiOutputPort() const;
+
+    /** Returns a channel index for a port
+     
+        @param port The port to find.
+    */
+    int getChannelPort (const uint32 port) const;
+
+    /** Returns a port index for a channel of given type
+     
+        @param type The port type to find
+        @param channel The channel to find
+        @param isInput True if for an input port
+    */
+    uint32 getPortForChannel (const PortType type, const int channel, const bool isInput) const;
+
+    int getNthPort (const PortType type, const int channel, bool, bool) const;
+
+    /** Returns true if an input port */
+    bool isPortInput (const uint32 port) const;
+
+    /** Returns true if an output port */
+    bool isPortOutput (const uint32 port) const;
+
+    //==========================================================================
+    virtual void refreshPorts() {}
+
+    //==========================================================================
+    /** Returns true if the underyling processor is a SubGraph or Graph */
+    bool isGraph() const noexcept;
+
+    /** Returns true if the processor is a root graph */
+    bool isRootGraph() const noexcept;
+
+    /** Returns true if the processor is a subgraph */
+    bool isSubGraph() const noexcept;
+
+    /** Get the type string for this Node */
+    const String getTypeString() const noexcept;
+
+    /** Returns true if the parameter is valid.
+        Valid = special param index or positive and below
+                the number of params provided by the implementation
+     */
+    bool containsParameter (const int index) const;
+
+    /** Fill the details... */
+    virtual void getPluginDescription (juce::PluginDescription& desc) const;
+
+    /** Returns true if the processor is suspended */
+    bool isSuspended() const;
+
+    /** Suspend processing */
+    void suspendProcessing (const bool);
+
+    /** Upper bound applied to any latency value in samples.
+
+        Plugin-reported latency and delay compensation size per-channel delay
+        buffers in the graph builder, so a bogus value would otherwise allocate
+        gigabytes. About 21 seconds at 48 kHz.
+    */
+    static constexpr int maxLatencySamples = 1 << 20;
+
+    /** Get latency audio samples */
+    int getLatencySamples() const;
+
+    /** Set the Input Gain of this Node */
+    void setInputGain (const float f);
+
+    /** Set the Gain of this Node */
+    void setGain (const float f);
+
+    inline float getInputGain() const { return inputGain.get(); }
+    inline float getGain() const { return gain.get(); }
+    inline float getLastGain() const { return lastGain.get(); }
+    inline float getLastInputGain() const { return lastInputGain.get(); }
+
+    inline void updateGain() noexcept
+    {
+        if (lastGain.get() != gain.get())
+            lastGain = gain;
+        if (lastInputGain.get() != inputGain.get())
+            lastInputGain = inputGain;
+    }
+
+    juce::ValueTree createPortsData() const;
+
+    bool isAudioIONode() const;
+    bool isAudioInputNode() const;
+    bool isAudioOutputNode() const;
+    bool isMidiIONode() const;
+    bool isMidiDeviceNode() const;
+
+    /* Returns the parent graph.
+       If one has not been set, then this will return nullptr.
+     */
+    GraphNode* getParentGraph() const;
+
+    void setInputRMS (int chan, float rms, int numSamples);
+    float getInputRMS (int chan) const { return (chan < inRMS.size()) ? inRMS.getUnchecked (chan)->value.get() : 0.0f; }
+    void setOutputRMS (int chan, float rms, int numSamples);
+    float getOutputRMS (int chan) const { return (chan < outRMS.size()) ? outRMS.getUnchecked (chan)->value.get() : 0.0f; }
+
+    //=========================================================================
+    /** Connect this node's output audio to another node's input audio */
+    void connectAudioTo (const Processor* other);
+
+    //=========================================================================
+    /** Enable or disable this node */
+    void setEnabled (const bool shouldBeEnabled);
+
+    /** Returns true if this node is enabled */
+    inline bool isEnabled() const { return enabled.get() == 1; }
+
+    //=========================================================================
+    inline void setKeyRange (const int low, const int high)
+    {
+        jassert (low <= high);
+        jassert (juce::isPositiveAndBelow (low, 128));
+        jassert (juce::isPositiveAndBelow (high, 128));
+        keyRangeLow.set (low);
+        keyRangeHigh.set (high);
+    }
+
+    inline void setKeyRange (const juce::Range<int>& range) { setKeyRange (range.getStart(), range.getEnd()); }
+
+    inline juce::Range<int> getKeyRange() const { return juce::Range<int> { keyRangeLow.get(), keyRangeHigh.get() }; }
+
+    //=========================================================================
+    inline void setTransposeOffset (const int value)
+    {
+        jassert (value >= -24 && value <= 24);
+        transposeOffset.set (value);
+    }
+
+    inline int getTransposeOffset() const { return transposeOffset.get(); }
+
+    const juce::CriticalSection& getPropertyLock() const { return propertyLock; }
+
+    //=========================================================================
+    /** Returns the file used for the current global MIDI Program */
+    juce::File getMidiProgramFile (int program = -1) const;
+
+    /** Returns true if this node should use global MIDI programs */
+    inline bool useGlobalMidiPrograms() const { return globalMidiPrograms.get() == 1; }
+
+    /** Change usage of global midi programs to on or off */
+    inline void setUseGlobalMidiPrograms (bool use) { globalMidiPrograms.set (use ? 1 : 0); }
+
+    /** True if MIDI programs should be loaded when Program change messages
+        are received */
+    inline bool areMidiProgramsEnabled() const { return midiProgramsEnabled.get() == 1; }
+
+    /** Enable or disable changing midi programs */
+    inline void setMidiProgramsEnabled (bool enabled) { midiProgramsEnabled.set (enabled ? 1 : 0); }
+
+    /** Returns the active midi program */
+    inline int getMidiProgram() const { return midiProgram.get(); }
+
+    /** Sets the MIDI program, note that this won't load it */
+    void setMidiProgram (const int program);
+
+    /** Sets the MIDI program's name */
+    void setMidiProgramName (const int program, const String& name);
+
+    /** Changes the number of a saved local MIDI program.
+
+        Moves the saved program (its state and name) from one program number
+        to another. Not supported for global MIDI programs.
+
+        @param from  The zero-based program number to move (0-127)
+        @param to    The zero-based destination program number (0-127)
+        @return true if the program was renumbered, false if the operation was
+                not possible (global mode, out of range, no saved program at
+                @p from, or a saved program already occupies @p to)
+    */
+    bool changeMidiProgramNumber (int from, int to);
+
+    /** Gets the MIDI program's name */
+    juce::String getMidiProgramName (const int program) const;
+
+    /** Reloads the active MIDI program */
+    void reloadMidiProgram();
+
+    /** Save the current MIDI program */
+    void saveMidiProgram();
+
+    /** Saves the node's current live state into a specific local program slot.
+
+        Unlike saveMidiProgram(), this targets an arbitrary program number
+        rather than the active one, and does not change the active program.
+        Not supported for global MIDI programs.
+
+        @param program  The zero-based program number to store into (0-127)
+    */
+    void saveMidiProgram (int program);
+
+    /** Returns the next unused MIDI program number.
+
+        Searches upward from @p after (exclusive), wrapping around from 127
+        back to 0, for the first program slot that has no saved program.
+        Follows the current mode (global files or local in-memory programs).
+
+        @param after  The zero-based program to search from (typically the
+                      currently active program)
+        @return the next unused program number (0-127), or -1 if all 128
+                slots are occupied
+    */
+    int nextAvailableMidiProgram (int after) const;
+
+    /** Removes a MIDI Program */
+    void removeMidiProgram (int program, bool global);
+
+    /** Get all MIDI program states stored directly on the node */
+    void getMidiProgramsState (juce::String& state) const;
+
+    /** Load all MIDI program states to be stored on the node.
+
+        @param state    The state to set. If this is empty, the midi programs
+                        on the node will be cleared.
+     */
+    void setMidiProgramsState (const juce::String& state);
+
+    /** Lightweight description of one saved MIDI program. */
+    struct MidiProgramInfo {
+        int program;       ///< Zero-based program index (0-127)
+        juce::String name; ///< Program name
+    };
+
+    /** Returns the saved MIDI programs for this node.
+
+        Follows the current mode: when useGlobalMidiPrograms() is true the
+        global program files on disk are enumerated, otherwise the local
+        in-memory programs are returned. The result is sorted ascending by
+        program number.
+
+        @return the saved MIDI programs
+    */
+    juce::Array<MidiProgramInfo> getMidiPrograms() const;
+
+    //=========================================================================
+    inline void setMidiChannels (const juce::BigInteger& ch)
+    {
+        juce::ScopedLock sl (propertyLock);
+        midiChannels.setChannels (ch);
+    }
+
+    inline const MidiChannels& getMidiChannels() const { return midiChannels; }
+
+    //=========================================================================
+    inline virtual int getNumPrograms() const
+    {
+        if (auto* const proc = getAudioProcessor())
+            return proc->getNumPrograms();
+        return 1;
+    }
+
+    inline virtual int getCurrentProgram() const
+    {
+        if (auto* const proc = getAudioProcessor())
+            return proc->getCurrentProgram();
+        return 0;
+    }
+
+    inline virtual const juce::String getProgramName (int index) const
+    {
+        if (auto* const proc = getAudioProcessor())
+            return proc->getProgramName (index);
+        return "Program " + String (index + 1);
+    }
+
+    inline virtual void setCurrentProgram (int index)
+    {
+        if (auto* const proc = getAudioProcessor())
+            return proc->setCurrentProgram (index);
+    }
+
+    //==========================================================================
+    void setMuted (bool muted);
+    bool isMuted() const { return mute.get() == 1; }
+    void setMuteInput (bool shouldMuteInput) { muteInput.set (shouldMuteInput ? 1 : 0); }
+    bool isMutingInputs() const { return muteInput.get() == 1; }
+
+    //==========================================================================
+    virtual void getState (juce::MemoryBlock&) = 0;
+    virtual void setState (const void*, int sizeInBytes) = 0;
+
+    //==========================================================================
+    /** Whether the node can run at a rate different from its parent graph. */
+    virtual bool supportsOversampling() const noexcept { return true; }
+    void setOversamplingFactor (int osFactor);
+    int getOversamplingFactor();
+
+    //==========================================================================
+    void setDelayCompensation (double delayMs);
+    double getDelayCompensation() const;
+    int getDelayCompensationSamples() const;
+
+    //=========================================================================
+    virtual bool hasEditor() { return false; }
+    virtual Editor* createEditor() { return nullptr; }
+
+    //=========================================================================
+    /** Triggered when the enabled state changes */
+    Signal<void (Processor*)> enablementChanged;
+
+    /** Triggered when the bypass state changes */
+    Signal<void (Processor*)> bypassChanged;
+
+    /** Triggered when the current MIDI program changes */
+    Signal<void()> midiProgramChanged;
+
+    /** Triggered when the mute state changes */
+    Signal<void (Processor*)> muteChanged;
+
+    /** Triggered when the output gain changes */
+    Signal<void (Processor*)> gainChanged;
+
+    /** Triggered when the input gain changes */
+    Signal<void (Processor*)> inputGainChanged;
+
+    /** Triggered immediately before this node is removed from a graph */
+    Signal<void()> willBeRemoved;
+
+    /** Triggered when the ports have changed */
+    Signal<void()> portsChanged;
+
+    /** Triggered when the node changes its name */
+    Signal<void()> nameChanged;
+
+protected:
+    Processor (uint32 nodeId) noexcept;
+    Processor (const PortList& ports);
+
+    void setPorts (const PortList&);
+    virtual void initialize() {}
+    void addPatch (PatchParameter* param) { _patches.add (param); }
+
+    /** Clear the top level referenced parameters. Some node types
+        can use this in their destructor if deletion order is important
+        for processors/parameters
+     */
+    void clearParameters();
+
+    void setName (const String& newName)
+    {
+        if (newName.isNotEmpty() && newName != name) {
+            name = newName;
+            nameChanged();
+        }
+    }
+
+    //==========================================================================
+    /** Set intrinsic latency in rendering-rate samples. Graph-facing latency is converted
+        to parent-rate samples by getLatencySamples(). Values are clamped to [0, maxLatencySamples]. */
+    void setLatencySamples (int latency);
+
+    //==========================================================================
+    virtual ParameterPtr getParameter (const PortDescription& port) { return nullptr; }
+
+    //==========================================================================
+    void triggerPortReset();
+
+    PortList portList() const noexcept { return ports; }
+
+private:
+    friend class EngineService;
+    friend class GraphRender::ProcessBufferOp;
+    friend class ProcessBufferOp;
+    friend class GraphManager;
+    friend class GraphNode;
+    friend class Node;
+
+    PortList ports;
+    GraphNode* parent = nullptr;
+    bool isPrepared = false;
+
+    // High bit closes admission; low bits count in-flight render operations.
+    static constexpr unsigned renderClosed = 1u << 31;
+    std::atomic<unsigned> renderUsers { renderClosed };
+    void closeRenderAdmission();
+    struct RenderLease {
+        explicit RenderLease (Processor& p) : owner (p)
+        {
+            auto users = owner.renderUsers.load();
+            acquired = false;
+            while ((users & renderClosed) == 0) {
+                if (owner.renderUsers.compare_exchange_weak (users, users + 1)) {
+                    acquired = true;
+                    break;
+                }
+            }
+        }
+        ~RenderLease()
+        {
+            if (acquired)
+                owner.renderUsers.fetch_sub (1);
+        }
+        RenderLease (const RenderLease&) = delete;
+        RenderLease& operator= (const RenderLease&) = delete;
+        Processor& owner;
+        bool acquired;
+    };
+    std::atomic<bool> requestedEnabled { true };
+    std::atomic<int> requestedOversampling { 0 };
+    void applyEnabled (bool);
+    void applyOversamplingFactor (int);
+    juce::Atomic<int> enabled { 1 };
+    juce::Atomic<int> bypassed { 0 };
+    juce::Atomic<int> mute { 0 };
+    juce::Atomic<int> muteInput { 0 };
+
+    double sampleRate = 0.0;
+    int blockSize = 0;
+    std::atomic<int> latencySamples { 0 };
+    juce::String name;
+
+    ParameterArray parameters, parametersOut;
+    PatchParameterArray _patches;
+
+    juce::Atomic<float> gain, lastGain, inputGain, lastInputGain;
+
+    /** Per-channel RMS meter integrator. Accumulates the block mean-square with a
+        fixed time constant so the metered level is independent of the host's
+        buffer size (see updateRMSMeter). */
+    struct RMSMeter {
+        float meanSquare = 0.0f;  // running mean-square, audio thread only
+        AtomicValue<float> value; // smoothed linear RMS handed to the UI thread
+    };
+    juce::OwnedArray<RMSMeter> inRMS, outRMS;
+
+    /** Integrates a block's RMS into the given meter with a fixed time window. */
+    void updateRMSMeter (RMSMeter& meter, float blockRMS, int numSamples);
+
+    juce::Atomic<int> keyRangeLow { 0 };
+    juce::Atomic<int> keyRangeHigh { 127 };
+    juce::Atomic<int> transposeOffset { 0 };
+    MidiChannels midiChannels;
+
+    juce::Atomic<int> midiProgram { 0 };
+    juce::Atomic<int> lastMidiProgram { -1 };
+    juce::Atomic<int> midiProgramsEnabled { 0 };
+    juce::Atomic<int> globalMidiPrograms { 0 };
+
+    juce::CriticalSection propertyLock;
+    struct EnablementUpdater : public juce::AsyncUpdater {
+        EnablementUpdater (Processor& g) : graph (g) {}
+        ~EnablementUpdater() {}
+        void handleAsyncUpdate() override;
+        Processor& graph;
+    } enablement;
+
+    struct MidiProgramLoader : public juce::AsyncUpdater {
+        MidiProgramLoader (Processor& n) : node (n) {}
+        ~MidiProgramLoader() { cancelPendingUpdate(); }
+        void handleAsyncUpdate() override;
+        Processor& node;
+    } midiProgramLoader;
+
+    friend struct PortResetter;
+    struct PortResetter : public juce::AsyncUpdater {
+        PortResetter (Processor& n) : node (n) {}
+        ~PortResetter() { cancelPendingUpdate(); }
+        void handleAsyncUpdate() override;
+        Processor& node;
+    } portResetter;
+
+    struct MidiProgram {
+        int program;
+        juce::String name;
+        juce::MemoryBlock state;
+    };
+    mutable juce::OwnedArray<MidiProgram> midiPrograms;
+    MidiProgram* getMidiProgram (int) const;
+
+    void setParentGraph (GraphNode*);
+    void prepare (double sampleRate, int blockSize, GraphNode*, bool willBeEnabled = false);
+    void unprepare();
+    void resetPorts();
+
+    std::unique_ptr<Oversampler<float>> oversampler;
+    int osPow = 0;
+    float osLatency = 0.0f;
+    juce::dsp::Oversampling<float>* getOversamplingProcessor();
+
+    ParameterPtr getOrCreateParameter (const PortDescription&);
+
+    double delayCompMillis = 0.0;
+    int delayCompSamples = 0;
+    void updateDelayCompensationSamples();
+
+    struct ScaledPlayHead : juce::AudioPlayHead
+    {
+        explicit ScaledPlayHead (const Processor& p) : processor (p) {}
+        juce::Optional<PositionInfo> getPosition() const override;
+        const Processor& processor;
+    };
+    mutable ScaledPlayHead scaledPlayHead { *this };
+    std::atomic<int> processingFactor { 1 };
+    juce::AudioPlayHead* _playhead { nullptr };
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (Processor)
+};
+
+/** A convenient typedef for referring to a pointer to a node object. */
+using ProcessorPtr = juce::ReferenceCountedObjectPtr<Processor>;
+
+} // namespace element

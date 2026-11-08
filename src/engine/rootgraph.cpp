@@ -1,0 +1,34 @@
+// Copyright 2023 Kushview, LLC <info@kushview.net>
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include "engine/rootgraph.hpp"
+
+namespace element {
+
+RootGraph::RootGraph (Context& c)
+    : GraphNode (c) {}
+
+void RootGraph::refreshPorts()
+{
+    GraphNode::refreshPorts();
+}
+
+void RootGraph::setPlayConfigFor (DeviceManager& devices)
+{
+    if (auto* const device = devices.getCurrentAudioDevice())
+        setPlayConfigFor (device);
+}
+
+void RootGraph::setPlayConfigFor (AudioIODevice* device)
+{
+    jassert (device != nullptr);
+    setRenderDetails (device->getCurrentSampleRate(),
+                      device->getCurrentBufferSizeSamples());
+}
+
+void RootGraph::setPlayConfigFor (const DeviceManager::AudioDeviceSetup& setup)
+{
+    setRenderDetails (setup.sampleRate, setup.bufferSize);
+}
+
+} // namespace element

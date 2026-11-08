@@ -1,0 +1,51 @@
+version = 1
+
+[[annotations]]
+path = [ "src/lua/src/*.*", "src/lua/src/Makefile" ]
+SPDX-FileCopyrightText = "Copyright (C) 1994-2020 Lua.org, PUC-Rio."
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = "data/fonts/Roboto-Regular.ttf"
+SPDX-FileCopyrightText = "Copyright 2011 Google Inc."
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = [ "*.md", "src/**/*.rc", "docs/**/*.md", "docs/**/*.css", 
+         "test/**/*.md", ".clang-format", "**/.clang-format", 
+         "data/intro.txt", "data/developers.txt", "cmake/buildversion.txt.in",
+         "cmake/version.txt.in", "data/acknowledgements.txt", 
+         "src/res/icon.ico", "data/**/*.png", "data/**/*.svg", 
+         "data/**/*.els", ".github/**/*.*", ".claude/settings.json" ]
+SPDX-FileCopyrightText = "Kushview, LLC."
+SPDX-License-Identifier = "CC0-1.0"
+
+
+[[annotations]]
+path = [ ".gitignore", "**/.gitignore", 
+         ".gitmodules", ".dockerignore", ".vscode/*.*",
+         "**/sol/config.hpp", "test/**/package.json", "Dockerfile*",
+         "**/element.desktop.in", "docs/config.ld" ]
+SPDX-FileCopyrightText = "Kushview, LLC."
+SPDX-License-Identifier = "GPL-3.0-or-later"
+
+[[annotations]]
+path = "data/sample-pad/acoustic_*.flac"
+SPDX-FileCopyrightText = "Versilian Studios LLC and Karoryfer Samples"
+SPDX-License-Identifier = "CC0-1.0"
+
+[[annotations]]
+path = "data/sample-pad/electronic_*.flac"
+SPDX-FileCopyrightText = "Alexander F. Rødseth (xyproto)"
+SPDX-License-Identifier = "CC0-1.0"
+
+[[annotations]]
+path = ["data/sample-pad/README.md", "data/sample-pad/manifest.json"]
+SPDX-FileCopyrightText = "2026 jiri-god"
+SPDX-License-Identifier = "CC0-1.0"
+
+[[annotations]]
+path = [ "README.md", "LICENSING.md", "CONTRIBUTING.md", "THIRD-PARTY-NOTICES.md", "docs/building.md", "docs/quick-start.md", "docs/rc1-notes.md", ".github/workflows/macos.yml" ]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 QLooper contributors"
+SPDX-License-Identifier = "CC0-1.0"

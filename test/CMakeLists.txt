@@ -1,0 +1,173 @@
+# SPDX-FileCopyrightText: 2026 Kushview, LLC
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+file(GLOB_RECURSE TEST_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
+
+juce_add_console_app(test_element)
+target_sources(test_element PRIVATE ${TEST_SOURCES})
+target_link_libraries(test_element PRIVATE kv::element)
+target_include_directories(test_element
+    PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        ${GENERATED_INCLUDE_DIR}
+        ${Boost_INCLUDE_DIRS})
+target_compile_definitions(test_element
+    PRIVATE
+        EL_TEST_SOURCE_ROOT="${CMAKE_SOURCE_DIR}"
+        EL_TEST_SCANNER_EXE_PATH="$<TARGET_FILE:element_app>")
+
+# Deliberately misbehaving "plugins" for PluginScannerTests: modules that
+# crash or hang on load, laid out as VST3s so the scanner worker loads them.
+# Opt-in at runtime via EL_TEST_SCANNER_INTEGRATION=1. The $<1:...> generator
+# expressions stop multi-config generators appending a per-config directory.
+foreach(_kind IN ITEMS crasher hanger)
+    add_library(el_test_${_kind} MODULE fixture/badplugin.c)
+    set(_dir "${CMAKE_CURRENT_BINARY_DIR}/badplugins/${_kind}")
+    if(WIN32)
+        # Single-file VST3: a renamed DLL.
+        set_target_properties(el_test_${_kind} PROPERTIES
+            PREFIX "" OUTPUT_NAME "${_kind}" SUFFIX ".vst3"
+            LIBRARY_OUTPUT_DIRECTORY "$<1:${_dir}>")
+    elseif(APPLE)
+        set(_contents "${_dir}/${_kind}.vst3/Contents")
+        set_target_properties(el_test_${_kind} PROPERTIES
+            PREFIX "" OUTPUT_NAME "${_kind}" SUFFIX ""
+            LIBRARY_OUTPUT_DIRECTORY "$<1:${_contents}/MacOS>")
+        file(WRITE "${_contents}/Info.plist"
+"<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
+<plist version=\"1.0\">
+<dict>
+    <key>CFBundleExecutable</key><string>${_kind}</string>
+    <key>CFBundleIdentifier</key><string>net.kushview.test.${_kind}</string>
+    <key>CFBundlePackageType</key><string>BNDL</string>
+</dict>
+</plist>
+")
+    else()
+        set_target_properties(el_test_${_kind} PROPERTIES
+            PREFIX "" OUTPUT_NAME "${_kind}" SUFFIX ".so"
+            LIBRARY_OUTPUT_DIRECTORY
+                "$<1:${_dir}/${_kind}.vst3/Contents/${CMAKE_SYSTEM_PROCESSOR}-linux>")
+    endif()
+    add_dependencies(test_element el_test_${_kind})
+endforeach()
+target_compile_definitions(el_test_hanger PRIVATE EL_TEST_HANG=1)
+target_compile_definitions(test_element PRIVATE
+    EL_TEST_BADPLUGINS_DIR="${CMAKE_CURRENT_BINARY_DIR}/badplugins")
+
+# Register all test suites with CTest
+add_test(NAME "AtomicValueTests" COMMAND test_element --run_test=AtomicValueTests)
+add_test(NAME "AtomicLockTests" COMMAND test_element --run_test=AtomicLockTests)
+add_test(NAME "AudioRoutingTests" COMMAND test_element --run_test=AudioRoutingTests)
+add_test(NAME "AuthTests" COMMAND test_element --run_test=AuthTests)
+add_test(NAME "BytesTest" COMMAND test_element --run_test=BytesTest)
+add_test(NAME "BusesLayoutTests" COMMAND test_element --run_test=BusesLayoutTests)
+add_test(NAME "CrashLogTests" COMMAND test_element --run_test=CrashLogTests)
+add_test(NAME "ConsoleTests" COMMAND test_element --run_test=ConsoleTests)
+add_test(NAME "JuceIntegrationTests" COMMAND test_element --run_test=JuceIntegrationTests)
+add_test(NAME "DataPathTests" COMMAND test_element --run_test=DataPathTests)
+add_test(NAME "DeviceMonitorTests" COMMAND test_element --run_test=DeviceMonitorTests)
+add_test(NAME "DSPScriptTest" COMMAND test_element --run_test=DSPScriptTest)
+add_test(NAME "Element" COMMAND test_element --run_test=Element)
+add_test(NAME "GraphNodeTests" COMMAND test_element --run_test=GraphNodeTests)
+add_test(NAME "GzipTests" COMMAND test_element --run_test=GzipTests)
+add_test(NAME "LatencyClampTests" COMMAND test_element --run_test=LatencyClampTests)
+add_test(NAME "IONodeTests" COMMAND test_element --run_test=IONodeTests)
+add_test(NAME "LinearFadeTest" COMMAND test_element --run_test=LinearFadeTest)
+add_test(NAME "MidiChannelMapTest" COMMAND test_element --run_test=MidiChannelMapTest)
+add_test(NAME "MidiMappingModelTests" COMMAND test_element --run_test=MidiMappingModelTests)
+add_test(NAME "MappingTargetTests" COMMAND test_element --run_test=MappingTargetTests)
+add_test(NAME "MidiMappingSessionTests" COMMAND test_element --run_test=MidiMappingSessionTests)
+add_test(NAME "MappingEngineTests" COMMAND test_element --run_test=MappingEngineTests)
+add_test(NAME "MappingLearnTests" COMMAND test_element --run_test=MappingLearnTests)
+add_test(NAME "MidiClockTest" COMMAND test_element --run_test=MidiClockTest)
+add_test(NAME "MidiEngineTests" COMMAND test_element --run_test=MidiEngineTests)
+add_test(NAME "MidiMonitorTests" COMMAND test_element --run_test=MidiMonitorTests)
+add_test(NAME "MidiProgramMapTests" COMMAND test_element --run_test=MidiProgramMapTests)
+add_test(NAME "MidiProgramTests" COMMAND test_element --run_test=MidiProgramTests)
+add_test(NAME "MidiScriptTests" COMMAND test_element --run_test=MidiScriptTests)
+if (APPLE)
+    add_test(NAME "MidiOutputTests" COMMAND test_element --run_test=MidiOutputTests)
+endif()
+add_test(NAME "NodeFactoryTests" COMMAND test_element --run_test=NodeFactoryTests)
+add_test(NAME "NodeObjectTests" COMMAND test_element --run_test=NodeObjectTests)
+add_test(NAME "NodeTests" COMMAND test_element --run_test=NodeTests)
+add_test(NAME "OversamplerTests" COMMAND test_element --run_test=OversamplerTests)
+add_test(NAME "PluginManagerTests" COMMAND test_element --run_test=PluginManagerTests)
+add_test(NAME "PluginMetadataTests" COMMAND test_element --run_test=PluginMetadataTests)
+add_test(NAME "PluginScannerTests" COMMAND test_element --run_test=PluginScannerTests)
+add_test(NAME "PortListTests" COMMAND test_element --run_test=PortListTests)
+add_test(NAME "PresetScriptsTest" COMMAND test_element --run_test=PresetScriptsTest)
+add_test(NAME "PortTypeTests" COMMAND test_element --run_test=PortTypeTests)
+add_test(NAME "RootGraphTests" COMMAND test_element --run_test=RootGraphTests)
+add_test(NAME "ScriptNodeTests" COMMAND test_element --run_test=ScriptNodeTests)
+add_test(NAME "ScriptInfoTest" COMMAND test_element --run_test=ScriptInfoTest)
+add_test(NAME "ScriptLoaderTest" COMMAND test_element --run_test=ScriptLoaderTest)
+add_test(NAME "ScriptManagerTest" COMMAND test_element --run_test=ScriptManagerTest)
+add_test(NAME "ScriptPlayground" COMMAND test_element --run_test=ScriptPlayground)
+add_test(NAME "SessionRecoveryTests" COMMAND test_element --run_test=SessionRecoveryTests)
+add_test(NAME "StartupGuardTests" COMMAND test_element --run_test=StartupGuardTests)
+add_test(NAME "SessionLoadBenchTests" COMMAND test_element --run_test=SessionLoadBenchTests)
+add_test(NAME "ShuttleTests" COMMAND test_element --run_test=ShuttleTests)
+add_test(NAME "TapTempoTests" COMMAND test_element --run_test=TapTempoTests)
+add_test(NAME "TaskManagerTests" COMMAND test_element --run_test=TaskManagerTests)
+add_test(NAME "TransportTests" COMMAND test_element --run_test=TransportTests)
+add_test(NAME "SessionTests" COMMAND test_element --run_test=SessionTests)
+add_test(NAME "ToggleGridTest" COMMAND test_element --run_test=ToggleGridTest)
+add_test(NAME "UpdateTests" COMMAND test_element --run_test=UpdateTests)
+add_test(NAME "VelocityCurveTest" COMMAND test_element --run_test=VelocityCurveTest)
+add_test(NAME "LooperTests" COMMAND test_element --run_test=LooperTests)
+
+add_test(NAME "LooperIntegrationTests" COMMAND test_element --run_test=LooperIntegrationTests)
+
+add_test(NAME "LooperManagerTests" COMMAND test_element --run_test=LooperManagerTests)
+add_test(NAME "RecorderTests" COMMAND test_element --run_test=RecorderTests)
+
+add_test(NAME "HostAudioSafetyTests" COMMAND test_element --run_test=HostAudioSafetyTests)
+
+add_test(NAME "SongManagerTests" COMMAND test_element --run_test=SongManagerTests)
+add_test(NAME "LooperReplaceTests" COMMAND test_element --run_test=LooperReplaceTests)
+
+add_test(NAME "SamplePadTests" COMMAND test_element --run_test=SamplePadTests)
+
+# Isolate deterministic allocation failure injection from JUCE and the main runner.
+add_executable(test_looper_allocation_failure fixture/looper_allocation_failure.cc)
+target_include_directories(test_looper_allocation_failure PRIVATE "${CMAKE_SOURCE_DIR}/src")
+target_compile_features(test_looper_allocation_failure PRIVATE cxx_std_20)
+add_dependencies(test_element test_looper_allocation_failure)
+add_test(NAME LooperAllocationFailure COMMAND test_looper_allocation_failure)
+
+add_test(NAME "PluginSampleUnitsTests" COMMAND test_element --run_test=PluginSampleUnitsTests)
+
+# A real minimal CLAP module exercises the provider's render path without
+# requiring an installed third-party plugin or audio hardware.
+add_library(el_test_transport_probe MODULE fixture/transportprobe.c)
+target_include_directories(el_test_transport_probe PRIVATE
+    "${PROJECT_SOURCE_DIR}/deps/clap-juce-extensions/clap-libs/clap/include")
+set(_probe_dir "${CMAKE_CURRENT_BINARY_DIR}/transport-probe")
+if(APPLE)
+    set(_probe_path "${_probe_dir}/TransportProbe.clap")
+    set_target_properties(el_test_transport_probe PROPERTIES PREFIX "" SUFFIX ""
+        OUTPUT_NAME "TransportProbe"
+        LIBRARY_OUTPUT_DIRECTORY "$<1:${_probe_path}/Contents/MacOS>")
+    file(WRITE "${_probe_path}/Contents/Info.plist"
+        "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>CFBundleExecutable</key><string>TransportProbe</string><key>CFBundleIdentifier</key><string>net.kushview.test.transport</string><key>CFBundlePackageType</key><string>BNDL</string></dict></plist>")
+else()
+    set(_probe_path "${_probe_dir}/TransportProbe.clap")
+    set_target_properties(el_test_transport_probe PROPERTIES PREFIX "" SUFFIX ".clap"
+        OUTPUT_NAME "TransportProbe" LIBRARY_OUTPUT_DIRECTORY "$<1:${_probe_dir}>")
+endif()
+add_dependencies(test_element el_test_transport_probe)
+target_compile_definitions(test_element PRIVATE EL_TEST_TRANSPORT_PROBE="${_probe_path}")
+add_test(NAME "ClapTransportTests" COMMAND test_element --run_test=ClapTransportTests)
+
+add_test(NAME "RenderLifecycleTests" COMMAND test_element --run_test=RenderLifecycleTests)
+
+add_test(NAME "LooperReviewRegressionTests" COMMAND test_element --run_test=LooperReviewRegressionTests)
+
+add_test(NAME "MidiRealtimeRegressionTests" COMMAND test_element --run_test=MidiRealtimeRegressionTests)
+
+add_test(NAME LooperImportTests COMMAND test_element --run_test=LooperImportTests)
+
+add_test(NAME "LooperRecordingControlTests" COMMAND test_element --run_test=LooperRecordingControlTests)

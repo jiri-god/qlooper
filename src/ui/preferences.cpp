@@ -1,0 +1,1468 @@
+// Copyright 2023 Kushview, LLC <info@kushview.net>
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include <thread>
+
+#include <element/context.hpp>
+#include <element/devices.hpp>
+#include <element/plugins.hpp>
+#include <element/settings.hpp>
+#include <element/ui.hpp>
+#include <element/ui/content.hpp>
+#include <element/ui/mainwindow.hpp>
+#include <element/ui/preferences.hpp>
+#include <element/ui/updater.hpp>
+#include <element/version.hpp>
+
+#include "engine/midiengine.hpp"
+#include "engine/midipanic.hpp"
+#include "engine/tasksystem.hpp"
+#include "messages.hpp"
+#include "auth.hpp"
+#include "services/oscservice.hpp"
+#include "ui/buttons.hpp"
+#include "ui/viewhelpers.hpp"
+
+namespace element {
+
+class Preferences::PageList : public ListBox,
+                              public ListBoxModel
+{
+public:
+    PageList (Preferences& prefs)
+        : owner (prefs),
+          font (FontOptions (16.0f))
+    {
+        setModel (this);
+    }
+
+    ~PageList()
+    {
+        setModel (nullptr);
+    }
+
+    int getNumRows()
+    {
+        return pageNames.size();
+    }
+
+    void paint (Graphics& g)
+    {
+        g.fillAll (Colors::widgetBackgroundColor.darker (0.45f));
+    }
+
+    virtual void paintListBoxItem (int rowNumber, Graphics& g, int width, int height, bool rowIsSelected)
+    {
+        if (! isPositiveAndBelow (rowNumber, pageNames.size()))
+            return;
+        ViewHelpers::drawBasicTextRow (pageNames[rowNumber], g, width, height, rowIsSelected);
+    }
+
+    void listBoxItemClicked (int row, const MouseEvent& e)
+    {
+        if (isPositiveAndBelow (row, pageNames.size()) && page != pageNames[row])
+        {
+            page = pageNames[row];
+            owner.setPage (page);
+        }
+    }
+
+    virtual String getTooltipForRow (int row)
+    {
+        String tool (pageNames[row]);
+        tool << String (" ") << "settings";
+        return tool;
+    }
+
+    int indexOfPage (const String& name) const
+    {
+        return pageNames.indexOf (name);
+    }
+
+private:
+    friend class Preferences;
+
+    void addItem (const String& name)
+    {
+        pageNames.addIfNotAlreadyThere (name);
+        updateContent();
+    }
+
+    Font font;
+    Preferences& owner;
+    StringArray pageNames;
+    String page;
+};
+
+//==============================================================================
+/** A labelled on/off setting: a bold label on the left and a SettingButton on
+    the right. Owned by a SettingsPage and laid out with layoutSetting(). */
+class BoolSettingRow
+{
+public:
+    /** Adds the label and button to the parent and wires the change callback.
+
+        @param parent    The page that owns this row.
+        @param text      The label text.
+        @param initial   The initial toggle state.
+        @param onChange  Called after the user toggles the button.
+    */
+    void init (Component& parent, const String& text, bool initial, std::function<void()> onChange)
+    {
+        parent.addAndMakeVisible (label);
+        label.setText (text, dontSendNotification);
+        label.setFont (Font (FontOptions (12.0, Font::bold)));
+        parent.addAndMakeVisible (button);
+        button.setClickingTogglesState (true);
+        button.setToggleState (initial, dontSendNotification);
+        button.onClick = std::move (onChange);
+    }
+
+    bool get() const { return button.getToggleState(); }
+    void set (bool state) { button.setToggleState (state, dontSendNotification); }
+    void setYesNoText (const String& yes, const String& no) { button.setYesNoText (yes, no); }
+
+    void setEnabled (bool enabled)
+    {
+        label.setEnabled (enabled);
+        button.setEnabled (enabled);
+    }
+
+    Label label;
+    SettingButton button;
+};
+
+//==============================================================================
+class SettingsPage : public Component
+{
+public:
+    SettingsPage() = default;
+    virtual ~SettingsPage() {}
+
+protected:
+    void layoutSetting (Rectangle<int>& r, BoolSettingRow& row)
+    {
+        layoutSetting (r, row.label, row.button);
+    }
+
+    virtual void layoutSetting (Rectangle<int>& r, Label& label, Component& setting, const int valueWidth = -1, const int keyWidth = -1)
+    {
+        const int spacingBetweenSections = 6;
+        const int settingHeight = 22;
+        const int toggleWidth = valueWidth > 0 ? valueWidth : 40;
+        const int toggleHeight = 18;
+        const int labelWidth = keyWidth > 0 ? keyWidth : getWidth() / 2;
+
+        r.removeFromTop (spacingBetweenSections);
+        auto r2 = r.removeFromTop (settingHeight);
+        label.setBounds (r2.removeFromLeft (labelWidth));
+        r2 = r2.removeFromLeft (toggleWidth);
+        if (nullptr != dynamic_cast<SettingButton*> (&setting))
+            r2 = r2.withSizeKeepingCentre (toggleWidth, toggleHeight);
+        setting.setBounds (r2);
+    }
+};
+
+//==============================================================================
+class OSCSettingsPage : public SettingsPage,
+                        private AsyncUpdater
+{
+public:
+    OSCSettingsPage (Context& w, GuiService& g)
+        : world (w), gui (g)
+    {
+        auto& settings = world.settings();
+        enabled.init (*this, "OSC Host Enabled?", settings.isOscHostEnabled(), [this]() {
+            updateEnablement();
+            triggerAsyncUpdate();
+        });
+        enabled.setYesNoText ("Yes", "No");
+
+        addAndMakeVisible (hostLabel);
+        hostLabel.setFont (Font (FontOptions (12.0, Font::bold)));
+        hostLabel.setText ("OSC Host", dontSendNotification);
+        addAndMakeVisible (hostField);
+        hostField.setReadOnly (true);
+        hostField.setText (IPAddress::getLocalAddress().toString());
+
+        addAndMakeVisible (portLabel);
+        portLabel.setFont (Font (FontOptions (12.0, Font::bold)));
+        portLabel.setText ("OSC Host Port", dontSendNotification);
+        addAndMakeVisible (portSlider);
+        portSlider.textFromValueFunction = [] (double value) -> String {
+            return String (roundToInt (value));
+        };
+        portSlider.setRange (1.0, 65535.0, 1.0);
+        portSlider.setValue ((double) settings.getOscHostPort());
+        portSlider.setSliderStyle (Slider::IncDecButtons);
+        portSlider.setTextBoxStyle (Slider::TextBoxLeft, false, 82, 22);
+        portSlider.onValueChange = [this]() {
+            world.settings().setOscHostPort (roundToInt (portSlider.getValue()));
+            triggerAsyncUpdate();
+        };
+    }
+
+    ~OSCSettingsPage() {}
+
+    void resized() override
+    {
+        auto r = getLocalBounds();
+        layoutSetting (r, enabled);
+        layoutSetting (r, hostLabel, hostField, getWidth() / 2);
+        layoutSetting (r, portLabel, portSlider, getWidth() / 4);
+    }
+
+private:
+    Context& world;
+    GuiService& gui;
+    BoolSettingRow enabled;
+    Label hostLabel;
+    TextEditor hostField;
+    Label portLabel;
+    Slider portSlider;
+
+    void handleAsyncUpdate() override
+    {
+        requestServerUpdate();
+    }
+
+    void requestServerUpdate()
+    {
+        if (auto* const osc = gui.sibling<OSCService>())
+            osc->refreshWithSettings (true);
+    }
+
+    void updateEnablement()
+    {
+        world.settings().setOscHostEnabled (enabled.get());
+        hostField.setEnabled (enabled.get());
+        portSlider.setEnabled (enabled.get());
+    }
+};
+
+//==============================================================================
+class PluginSettingsComponent : public SettingsPage,
+                                public Button::Listener
+{
+public:
+    PluginSettingsComponent (Context& w)
+        : plugins (w.plugins()),
+          settings (w.settings())
+    {
+        addAndMakeVisible (activeFormats);
+        activeFormats.setText ("Enabled Plugin Formats", dontSendNotification);
+        activeFormats.setFont (Font (FontOptions (18.0, Font::bold)));
+        addAndMakeVisible (formatNotice);
+        formatNotice.setText ("Note: enabled format changes take effect upon restart", dontSendNotification);
+        formatNotice.setFont (Font (FontOptions (12.0, Font::italic)));
+#if JUCE_MAC
+        availableFormats.addArray ({ "AudioUnit", "VST", "VST3" });
+#else
+        availableFormats.addArray ({ "VST", "VST3" });
+#endif
+        for (const auto& f : availableFormats)
+        {
+            auto* toggle = formatToggles.add (new ToggleButton (f));
+            addAndMakeVisible (toggle);
+            toggle->setName (f);
+            toggle->setButtonText (nameForFormat (f));
+            toggle->setColour (ToggleButton::textColourId, Colors::textColor);
+            toggle->setColour (ToggleButton::tickColourId, Colours::black);
+            toggle->addListener (this);
+        }
+
+        updateToggleStates();
+    }
+
+    void resized() override
+    {
+        const int spacingBetweenSections = 6;
+        const int toggleInset = 4;
+
+        Rectangle<int> r (getLocalBounds());
+        activeFormats.setFont (Font (FontOptions (15.0f).withStyle ("Bold")));
+        activeFormats.setBounds (r.removeFromTop (18));
+        formatNotice.setBounds (r.removeFromTop (14));
+
+        r.removeFromTop (spacingBetweenSections);
+
+        for (auto* c : formatToggles)
+        {
+            auto r2 = r.removeFromTop (18);
+            c->setBounds (r2.removeFromRight (getWidth() - toggleInset));
+            r.removeFromTop (4);
+        }
+    }
+
+    void paint (Graphics&) override {}
+
+    void buttonClicked (Button*) override
+    {
+        writeSetting();
+        restoreSetting();
+    }
+
+private:
+    PluginManager& plugins;
+    Settings& settings;
+
+    Label activeFormats;
+
+    OwnedArray<ToggleButton> formatToggles;
+    StringArray availableFormats;
+
+    Label formatNotice;
+
+    const String key = Settings::pluginFormatsKey;
+    [[maybe_unused]] bool hasChanged = false;
+
+    String nameForFormat (const String& name)
+    {
+        if (name == "AudioUnit")
+            return "Audio Unit";
+        return name;
+    }
+
+    void updateToggleStates()
+    {
+        restoreSetting();
+    }
+
+    void restoreSetting()
+    {
+        StringArray toks;
+        toks.addTokens (settings.getUserSettings()->getValue (key), ",", "'");
+        for (auto* c : formatToggles)
+            c->setToggleState (toks.contains (c->getName()), dontSendNotification);
+    }
+
+    void writeSetting()
+    {
+        StringArray toks;
+        for (auto* c : formatToggles)
+            if (c->getToggleState())
+                toks.add (c->getName());
+
+        toks.trim();
+        const auto value = toks.joinIntoString (",");
+        settings.getUserSettings()->setValue (key, value);
+        settings.saveIfNeeded();
+    }
+};
+
+//==============================================================================
+class GeneralSettingsPage : public SettingsPage,
+                            public Value::Listener,
+                            public FilenameComponentListener
+{
+public:
+    enum ComboBoxIDs
+    {
+        ClockSourceInternal = 1,
+        ClockSourceMidiClock = 2
+    };
+
+    GeneralSettingsPage (Context& world, GuiService& g)
+        : pluginSettings (world),
+          defaultSessionFile ("Default Session", File(), true, false,
+                              false, // bool isForSaving,
+                              "*.els", //const String& fileBrowserWildcard,
+                              "", //const String& enforcedSuffix,
+                              "None"), //const String& textWhenNothingSelected)
+
+          settings (world.settings()),
+          engine (world.audio()),
+          gui (g)
+    {
+#if ! ELEMENT_SE
+        const String sessionStr = "session";
+#else
+        const String sessionStr = "graph";
+#endif
+
+        addAndMakeVisible (clockSourceLabel);
+        clockSourceLabel.setText ("Clock Source", dontSendNotification);
+        clockSourceLabel.setFont (Font (FontOptions (12.0, Font::bold)));
+        addAndMakeVisible (clockSourceBox);
+        clockSourceBox.addItem ("Internal", ClockSourceInternal);
+        clockSourceBox.addItem ("MIDI Clock", ClockSourceMidiClock);
+        clockSource.referTo (clockSourceBox.getSelectedIdAsValue());
+
+#if ELEMENT_UPDATER
+        checkForUpdates.init (*this, "Check for updates on startup", settings.checkForUpdates(), [this]() {
+            settings.setCheckForUpdates (checkForUpdates.get());
+            settingChanged();
+        });
+#endif
+        scanForPlugins.init (*this, "Scan plugins on startup", settings.scanForPluginsOnStartup(), [this]() {
+            settings.setScanForPluginsOnStartup (scanForPlugins.get());
+            settingChanged();
+        });
+        showPluginWindows.init (*this, "Automatically show plugin windows", settings.showPluginWindowsWhenAdded(), [this]() {
+            settings.setShowPluginWindowsWhenAdded (showPluginWindows.get());
+            settingChanged();
+        });
+        pluginWindowsOnTop.init (*this, "Plugin windows on top by default", settings.pluginWindowsOnTop(), [this]() {
+            settings.setPluginWindowsOnTop (pluginWindowsOnTop.get());
+            settingChanged();
+        });
+        hidePluginWindows.init (*this, "Hide plugin windows when app inactive", settings.hidePluginWindowsWhenFocusLost(), [this]() {
+            settings.setHidePluginWindowsWhenFocusLost (hidePluginWindows.get());
+            settingChanged();
+        });
+        openLastSession.init (*this, "Open last used " + sessionStr, settings.openLastUsedSession(), [this]() {
+            settings.setOpenLastUsedSession (openLastSession.get());
+            settingChanged();
+        });
+        askToSaveSession.init (*this, "Ask to save " + sessionStr + "s on exit", settings.askToSaveSession(), [this]() {
+            settings.setAskToSaveSession (askToSaveSession.get());
+            settingChanged();
+        });
+        systray.init (*this, "Show system tray", settings.isSystrayEnabled(), [this]() {
+            settings.setSystrayEnabled (systray.get());
+            startHidden.setEnabled (systray.get());
+            gui.refreshSystemTray();
+            settingChanged();
+        });
+        startHidden.init (*this, "Start hidden in system tray", settings.isStartHiddenEnabled(), [this]() {
+            settings.setStartHiddenEnabled (startHidden.get());
+            settingChanged();
+        });
+        startHidden.setEnabled (systray.get());
+
+        addAndMakeVisible (desktopScaleLabel);
+        desktopScaleLabel.setText ("Desktop scale", dontSendNotification);
+        desktopScaleLabel.setFont (Font (FontOptions (12.0, Font::bold)));
+        addAndMakeVisible (desktopScale);
+        desktopScale.textFromValueFunction = [] (double value) -> String {
+            return String (value, 2);
+        };
+        desktopScale.setRange (0.1, 8.0, 0.01);
+        desktopScale.setValue ((double) settings.getDesktopScale());
+        desktopScale.setSliderStyle (Slider::IncDecButtons);
+        desktopScale.setTextBoxStyle (Slider::TextBoxLeft, false, 82, 22);
+        desktopScale.onValueChange = [this]() {
+            settings.setDesktopScale (desktopScale.getValue());
+            desktopScale.setValue (settings.getDesktopScale(), dontSendNotification);
+            if (settings.getDesktopScale() != Desktop::getInstance().getGlobalScaleFactor())
+            {
+                Desktop::getInstance().setGlobalScaleFactor (settings.getDesktopScale());
+                if (auto* parent = findParentComponentOfClass<Preferences>())
+                    parent->updateSize();
+            }
+        };
+
+        addAndMakeVisible (defaultSessionFileLabel);
+        defaultSessionFileLabel.setText ("Default new Session", dontSendNotification);
+        defaultSessionFileLabel.setFont (Font (FontOptions (12.0, Font::bold)));
+        addAndMakeVisible (defaultSessionFile);
+        defaultSessionFile.setCurrentFile (settings.getDefaultNewSessionFile(), dontSendNotification);
+        defaultSessionFile.addListener (this);
+        addAndMakeVisible (defaultSessionClearButton);
+        defaultSessionClearButton.setButtonText ("X");
+        defaultSessionClearButton.onClick = [this]() {
+            defaultSessionFile.setCurrentFile (File(), false, sendNotificationAsync);
+        };
+#if ELEMENT_SE
+        defaultSessionFileLabel.setVisible (false);
+        defaultSessionFile.setVisible (false);
+#endif
+
+        const int source = String ("internal") == settings.getClockSource()
+                               ? ClockSourceInternal
+                               : ClockSourceMidiClock;
+        clockSourceBox.setSelectedId (source, dontSendNotification);
+        clockSource.setValue (source);
+        clockSource.addListener (this);
+
+        addAndMakeVisible (mainContentLabel);
+        mainContentLabel.setText ("UI Type", dontSendNotification);
+        mainContentLabel.setFont (Font (FontOptions (12.0, Font::bold)));
+        addAndMakeVisible (mainContentBox);
+        mainContentBox.addItem ("Standard", 1);
+        jassert (settings.getMainContentType() == "standard");
+        mainContentBox.setSelectedId (1, dontSendNotification);
+        mainContentBox.getSelectedIdAsValue().addListener (this);
+    }
+
+    virtual ~GeneralSettingsPage() noexcept
+    {
+        clockSource.removeListener (this);
+        mainContentBox.getSelectedIdAsValue().removeListener (this);
+    }
+
+    void filenameComponentChanged (FilenameComponent* f) override
+    {
+        if (f == &defaultSessionFile)
+        {
+            if (f->getCurrentFile().existsAsFile())
+                settings.setDefaultNewSessionFile (f->getCurrentFile());
+            else
+                settings.setDefaultNewSessionFile (File());
+        }
+
+        settings.saveIfNeeded();
+    }
+
+    void resized() override
+    {
+        const int spacingBetweenSections = 6;
+        const int settingHeight = 22;
+        const int comboWidth = getWidth() / 2;
+
+        Rectangle<int> r (getLocalBounds());
+        layoutSetting (r, clockSourceLabel, clockSourceBox, comboWidth);
+#if ELEMENT_UPDATER
+        layoutSetting (r, checkForUpdates);
+#endif
+        layoutSetting (r, scanForPlugins);
+        layoutSetting (r, showPluginWindows);
+        layoutSetting (r, pluginWindowsOnTop);
+        layoutSetting (r, hidePluginWindows);
+        layoutSetting (r, openLastSession);
+        layoutSetting (r, askToSaveSession);
+        layoutSetting (r, mainContentLabel, mainContentBox, comboWidth);
+        layoutSetting (r, systray);
+        layoutSetting (r, startHidden);
+        layoutSetting (r, desktopScaleLabel, desktopScale, getWidth() / 4);
+
+#if ! ELEMENT_SE
+        layoutSetting (r, defaultSessionFileLabel, defaultSessionFile, 190 - settingHeight);
+        defaultSessionClearButton.setBounds (defaultSessionFile.getRight(),
+                                             defaultSessionFile.getY(),
+                                             settingHeight - 2,
+                                             defaultSessionFile.getHeight());
+#endif
+
+        if (pluginSettings.isVisible())
+        {
+            r.removeFromTop (spacingBetweenSections * 2);
+            pluginSettings.setBounds (r);
+        }
+    }
+
+    void valueChanged (Value& value) override
+    {
+        if (value.refersToSameSourceAs (clockSource))
+        {
+            const var val = ClockSourceInternal == (int) clockSource.getValue() ? "internal" : "midiClock";
+            settings.setClockSource (val);
+            engine->applySettings (settings);
+            if (auto* cc = ViewHelpers::findContentComponent())
+                cc->refreshToolbar();
+        }
+        else if (value.refersToSameSourceAs (mainContentBox.getSelectedIdAsValue()))
+        {
+            const String uitype = "standard";
+            if (uitype != settings.getMainContentType())
+            {
+                settings.setMainContentType (uitype);
+                ViewHelpers::postMessageFor (this, new ReloadMainContentMessage());
+            }
+        }
+
+        settingChanged();
+    }
+
+private:
+    Label clockSourceLabel;
+    ComboBox clockSourceBox;
+    Value clockSource;
+
+    BoolSettingRow checkForUpdates;
+    BoolSettingRow scanForPlugins;
+
+    PluginSettingsComponent pluginSettings;
+
+    BoolSettingRow showPluginWindows;
+    BoolSettingRow pluginWindowsOnTop;
+    BoolSettingRow hidePluginWindows;
+    BoolSettingRow openLastSession;
+    BoolSettingRow askToSaveSession;
+
+    Label defaultSessionFileLabel;
+    FilenameComponent defaultSessionFile;
+    TextButton defaultSessionClearButton;
+
+    BoolSettingRow systray;
+    BoolSettingRow startHidden;
+
+    Label desktopScaleLabel;
+    Slider desktopScale;
+
+    Label mainContentLabel;
+    ComboBox mainContentBox;
+
+    Settings& settings;
+    AudioEnginePtr engine;
+    GuiService& gui;
+
+    void settingChanged()
+    {
+        settings.saveIfNeeded();
+        gui.stabilizeViews();
+        gui.refreshMainMenu();
+    }
+};
+
+//==============================================================================
+class AudioSettingsComponent : public SettingsPage
+{
+public:
+    AudioSettingsComponent (Context& g)
+        : devs (g.devices(), 1, DeviceManager::maxAudioChannels, 1, DeviceManager::maxAudioChannels, false, false, false, false),
+          settings (g.settings()),
+          devices (g.devices()),
+          multithreadingConfig (*this, g)
+    {
+        addAndMakeVisible (devs);
+        devs.setItemHeight (22);
+
+        addAndMakeVisible (experimentalLabel);
+        experimentalLabel.setText ("Experimental");
+        addAndMakeVisible (multithreadingLabel);
+        multithreadingLabel.setFont (Font (FontOptions (12.0, Font::bold)));
+        multithreadingLabel.setText ("Multithreaded Rendering", juce::dontSendNotification);
+        addAndMakeVisible (multithreadingConfig);
+        multithreadingConfig.stabilize();
+
+        setSize (300, 400);
+    }
+
+    ~AudioSettingsComponent()
+    {
+    }
+
+    void resized() override
+    {
+        Rectangle<int> r (getLocalBounds());
+        devs.setBounds (r.removeFromTop (devs.getHeight()));
+
+        // this will cause the experimental settings to position correctly
+        layoutExperimentalSettings();
+    }
+
+    void childBoundsChanged (Component* child) override
+    {
+        if (child == &devs)
+        {
+            // if the audio device selection changes, the controls to
+            // configure it can change, so reset the position of the 
+            // experimental settings
+            layoutExperimentalSettings();
+        }
+    }
+
+private:
+    Settings& settings;
+    juce::AudioDeviceSelectorComponent devs;
+    [[maybe_unused]] DeviceManager& devices;
+
+    void layoutExperimentalSettings()
+    {
+        Rectangle<int> r (getLocalBounds());
+        r.removeFromTop (devs.getHeight());
+
+        experimentalLabel.setBounds (r.removeFromTop (60));
+        auto inner = experimentalLabel.getBounds().reduced (10).withTrimmedTop (10);
+        layoutSetting (inner, multithreadingLabel, multithreadingConfig, getWidth() / 2);
+    }
+
+    GroupComponent experimentalLabel;
+    Label multithreadingLabel;
+    class MultithreadingComponent : public Component
+    {
+    public:
+        MultithreadingComponent (AudioSettingsComponent& o, Context& g)
+            : owner (o),
+              world (g)
+        {
+            addAndMakeVisible (enabled);
+            enabled.setTooltip ("Enabled?");
+            enabled.setButtonText ("");
+            enabled.setToggleState (false, dontSendNotification);
+            enabled.onClick = [this]() { save(); };
+
+            addAndMakeVisible (threadCount);
+            threadCount.setTooltip ("Num. worker threads");
+            threadCount.setSliderStyle (Slider::IncDecButtons);
+            threadCount.setRange (2.0, 16.0, 1.0);
+            threadCount.setValue (4.0, juce::dontSendNotification);
+            threadCount.setTextBoxStyle (Slider::TextBoxLeft, false, 30, threadCount.getTextBoxHeight());
+            threadCount.setWantsKeyboardFocus (false);
+            threadCount.onValueChange = [this]() { save(); };
+
+            stabilize();
+        }
+
+        ~MultithreadingComponent()
+        {
+            enabled.onClick = nullptr;
+            threadCount.onValueChange = nullptr;
+        }
+
+        void resized() override
+        {
+            auto r1 = getLocalBounds();
+            enabled.setBounds (r1.removeFromLeft (r1.getHeight()));
+            threadCount.setBounds (r1);
+        }
+
+        void stabilize()
+        {
+            const auto params = owner.settings.getMultithreadingParams();
+            enabled.setToggleState (params.enabled, juce::dontSendNotification);
+            threadCount.setValue (params.threadCount, juce::dontSendNotification);
+        }
+
+    private:
+        ToggleButton enabled;
+        Slider threadCount;
+        AudioSettingsComponent& owner;
+        Context& world;
+
+        void save()
+        {
+            MultithreadingParams params = {
+                enabled.getToggleState(),
+                (int) threadCount.getValue(),
+            };
+
+            owner.settings.setMultithreadingParams (params);
+
+            if (auto e = world.audio())
+                e->applySettings (world.settings());
+        }
+    } multithreadingConfig;
+};
+
+//==============================================================================
+class MidiSettingsPage : public SettingsPage,
+                         public ComboBox::Listener,
+                         public ChangeListener,
+                         public Timer
+{
+public:
+    MidiSettingsPage (Context& g)
+        : devices (g.devices()),
+          settings (g.settings()),
+          midi (g.midi()),
+          world (g),
+          panic (*this)
+    {
+        addAndMakeVisible (midiOutputLabel);
+        midiOutputLabel.setFont (Font (FontOptions (12.0, Font::bold)));
+        midiOutputLabel.setText ("MIDI Output Device", dontSendNotification);
+
+        addAndMakeVisible (midiOutput);
+        midiOutput.addListener (this);
+
+        addAndMakeVisible (midiOutLatencyLabel);
+        midiOutLatencyLabel.setFont (Font (FontOptions (12.0, Font::bold)));
+        midiOutLatencyLabel.setText ("Output latency (ms)", dontSendNotification);
+        addAndMakeVisible (midiOutLatencyLabel);
+
+        addAndMakeVisible (midiOutLatency);
+        midiOutLatency.textFromValueFunction = [] (double value) -> String {
+            return String (roundToInt (value));
+        };
+        midiOutLatency.setRange (-1000.0, 1000.0, 1.0);
+        midiOutLatency.setValue ((double) settings.getMidiOutLatency());
+        midiOutLatency.setSliderStyle (Slider::IncDecButtons);
+        midiOutLatency.setTextBoxStyle (Slider::TextBoxLeft, false, 82, 22);
+        midiOutLatency.onValueChange = [this]() {
+            world.settings().setMidiOutLatency (midiOutLatency.getValue());
+            if (auto e = world.audio())
+                e->applySettings (world.settings());
+        };
+#if JUCE_WINDOWS
+        midiOutLatencyLabel.setEnabled (false);
+        midiOutLatency.setEnabled (false);
+#endif
+
+        generateClock.init (*this, "Generate MIDI Clock", settings.generateMidiClock(), [this]() {
+            settings.setGenerateMidiClock (generateClock.get());
+            generateClock.set (settings.generateMidiClock());
+            applyEngineSettings();
+        });
+        generateClock.setYesNoText ("Yes", "No");
+
+        sendClockToInput.init (*this, "Send Clock to MIDI Input?", settings.sendMidiClockToInput(), [this]() {
+            settings.setSendMidiClockToInput (sendClockToInput.get());
+            sendClockToInput.set (settings.sendMidiClockToInput());
+            applyEngineSettings();
+        });
+        sendClockToInput.setYesNoText ("Yes", "No");
+
+        addAndMakeVisible (panicLabel);
+        panicLabel.setFont (Font (FontOptions (12.0, Font::bold)));
+        panicLabel.setText ("MIDI Panic CC", juce::dontSendNotification);
+        addAndMakeVisible (panic);
+        panic.stabilize();
+
+        startStopCont.init (*this, TRANS ("Transport: MIDI Start/Stop"), settings.transportRespondToStartStopContinue(), [this]() {
+            settings.setTransportRespondToStartStopContinue (startStopCont.get());
+            startStopCont.set (settings.transportRespondToStartStopContinue());
+            applyEngineSettings();
+        });
+        startStopCont.setYesNoText ("Yes", "No");
+
+        addAndMakeVisible (midiInputHeader);
+        midiInputHeader.setText ("Active MIDI Inputs", dontSendNotification);
+        midiInputHeader.setFont (Font (FontOptions (12.0f).withStyle ("Bold")));
+
+        midiInputs = std::make_unique<MidiInputs> (*this);
+        midiInputView.setViewedComponent (midiInputs.get(), false);
+        addAndMakeVisible (midiInputView);
+
+        setSize (300, 400);
+
+        devices.addChangeListener (this);
+        updateDevices();
+        startTimer (1 * 1000); // refresh if needed every 1 second
+    }
+
+    ~MidiSettingsPage()
+    {
+        devices.removeChangeListener (this);
+        midiInputs = nullptr;
+        midiOutput.removeListener (this);
+    }
+
+    void timerCallback() override
+    {
+        if ((midiInputs && midiInputs->getNumDevices() != MidiInput::getAvailableDevices().size()) || midiOutput.getNumItems() - 1 != MidiOutput::getAvailableDevices().size())
+        {
+            updateDevices();
+        }
+    }
+
+    void resized() override
+    {
+        const int spacingBetweenSections = 6;
+        const int settingHeight = 22;
+
+        Rectangle<int> r (getLocalBounds());
+        auto r2 = r.removeFromTop (settingHeight);
+        midiOutputLabel.setBounds (r2.removeFromLeft (getWidth() / 2));
+        midiOutput.setBounds (r2.withSizeKeepingCentre (r2.getWidth(), settingHeight));
+        layoutSetting (r, midiOutLatencyLabel, midiOutLatency, getWidth() / 4);
+        layoutSetting (r, generateClock);
+        layoutSetting (r, sendClockToInput);
+        layoutSetting (r, startStopCont);
+        layoutSetting (r, panicLabel, panic, getWidth() / 2);
+
+        r.removeFromTop (roundToInt ((double) spacingBetweenSections * 1.5));
+        midiInputHeader.setBounds (r.removeFromTop (24));
+
+        midiInputView.setBounds (r);
+        midiInputs->updateSize();
+    }
+
+    void applyEngineSettings()
+    {
+        if (auto engine = world.audio())
+            engine->applySettings (settings);
+    }
+
+    void comboBoxChanged (ComboBox* box) override
+    {
+        const auto dev = outputs[midiOutput.getSelectedId() - 10];
+        if (box == &midiOutput)
+            midi.setDefaultMidiOutput (dev);
+    }
+
+    void changeListenerCallback (ChangeBroadcaster*) override
+    {
+        updateDevices();
+        for (int i = 0; i < DocumentWindow::getNumTopLevelWindows(); ++i)
+            if (auto* main = dynamic_cast<MainWindow*> (DocumentWindow::getTopLevelWindow (i)))
+                main->refreshMenu();
+    }
+
+private:
+    DeviceManager& devices;
+    Settings& settings;
+    MidiEngine& midi;
+    Context& world;
+
+    Label midiOutputLabel;
+    ComboBox midiOutput;
+    Label midiOutLatencyLabel;
+    Slider midiOutLatency;
+    BoolSettingRow generateClock;
+    BoolSettingRow sendClockToInput;
+    BoolSettingRow startStopCont;
+
+    Label midiInputHeader;
+    Array<MidiDeviceInfo> outputs;
+
+    Label panicLabel;
+    class Panic : public Component
+    {
+    public:
+        Panic (MidiSettingsPage& o) : owner (o)
+        {
+            addAndMakeVisible (enabled);
+            enabled.setTooltip ("Enabled?");
+            enabled.setButtonText ("");
+            enabled.setToggleState (false, dontSendNotification);
+            enabled.onClick = [this]() { save(); };
+
+            addAndMakeVisible (channel);
+            channel.setTooltip ("CC channel. 0 = omni");
+            channel.setSliderStyle (Slider::IncDecButtons);
+            channel.setRange (0.0, 16.0, 1.0);
+            channel.setValue (1.0, juce::dontSendNotification);
+            channel.setTextBoxStyle (Slider::TextBoxLeft, false, 30, channel.getTextBoxHeight());
+            channel.setWantsKeyboardFocus (false);
+            channel.onValueChange = [this]() { save(); };
+
+            addAndMakeVisible (ccNumber);
+            ccNumber.setTooltip ("CC number");
+            ccNumber.setSliderStyle (Slider::IncDecButtons);
+            ccNumber.setRange (0.0, 127, 1.0);
+            ccNumber.setValue (21, juce::dontSendNotification);
+            ccNumber.setTextBoxStyle (Slider::TextBoxLeft, false, 34, ccNumber.getTextBoxHeight());
+            ccNumber.setWantsKeyboardFocus (false);
+            ccNumber.onValueChange = channel.onValueChange;
+
+            stabilize();
+        }
+
+        ~Panic()
+        {
+            enabled.onClick = nullptr;
+            ccNumber.onValueChange = nullptr;
+            channel.onValueChange = nullptr;
+        }
+
+        void resized() override
+        {
+            auto r1 = getLocalBounds();
+            enabled.setBounds (r1.removeFromLeft (r1.getHeight()));
+            auto r2 = r1.removeFromRight (r1.getWidth() * 0.5);
+            channel.setBounds (r1);
+            ccNumber.setBounds (r2);
+        }
+
+        void stabilize()
+        {
+            const auto params = owner.settings.getMidiPanicParams();
+            enabled.setToggleState (params.enabled, juce::dontSendNotification);
+            channel.setValue (params.channel, juce::dontSendNotification);
+            ccNumber.setValue (params.ccNumber, juce::dontSendNotification);
+        }
+
+    private:
+        ToggleButton enabled;
+        Slider channel;
+        Slider ccNumber;
+        MidiSettingsPage& owner;
+
+        void save()
+        {
+            MidiPanicParams params = {
+                enabled.getToggleState(),
+                (int) channel.getValue(),
+                (int) ccNumber.getValue()
+            };
+
+            owner.settings.setMidiPanicParams (params);
+            auto audio = owner.world.audio();
+            audio->applySettings (owner.settings);
+        }
+    } panic;
+
+    class MidiInputs : public Component,
+                       public Button::Listener
+    {
+    public:
+        MidiInputs (MidiSettingsPage& o)
+            : owner (o) {}
+
+        int getNumDevices() const { return midiInputs.size(); }
+
+        void updateDevices()
+        {
+            midiInputLabels.clearQuick (true);
+            midiInputs.clearQuick (true);
+            inputs = MidiInput::getAvailableDevices();
+
+            for (const auto& d : inputs)
+            {
+                auto* label = midiInputLabels.add (new Label());
+                label->setFont (Font (FontOptions (12.0f)));
+                label->setText (d.name, dontSendNotification);
+                addAndMakeVisible (label);
+
+                auto* btn = midiInputs.add (new SettingButton());
+                btn->setName (d.name);
+                btn->setClickingTogglesState (true);
+                btn->setYesNoText ("On", "Off");
+                btn->addListener (this);
+                addAndMakeVisible (btn);
+            }
+
+            updateSize();
+        }
+
+        void updateSize()
+        {
+            const int widthOfView = owner.midiInputView.getWidth() - owner.midiInputView.getScrollBarThickness();
+            setSize (jmax (200, widthOfView), computeHeight());
+        }
+
+        int computeHeight()
+        {
+            static int tick = 0;
+
+            const int spacingBetweenSections = 6;
+            const int settingHeight = 22;
+
+            int h = 1;
+            for (int i = 0; i < midiInputs.size(); ++i)
+            {
+                h += spacingBetweenSections;
+                h += settingHeight;
+            }
+
+            // this makes sure the height is always
+            // different and the viewport will refresh
+            if (tick == 0)
+                tick = 1;
+            else
+                tick = 0;
+
+            return h + tick;
+        }
+
+        void resized() override
+        {
+            const int spacingBetweenSections = 6;
+            const int settingHeight = 22;
+            const int toggleWidth = 40;
+            const int toggleHeight = 18;
+
+            jassert (midiInputLabels.size() == midiInputs.size());
+            auto r = getLocalBounds();
+            for (int i = 0; i < midiInputs.size(); ++i)
+            {
+                r.removeFromTop (spacingBetweenSections);
+                auto r2 = r.removeFromTop (settingHeight);
+                midiInputLabels.getUnchecked (i)->setBounds (r2.removeFromLeft (getWidth() / 2));
+                midiInputs.getUnchecked (i)->setBounds (
+                    r2.removeFromLeft (toggleWidth).withSizeKeepingCentre (toggleWidth, toggleHeight));
+            }
+        }
+
+        void buttonClicked (Button* btn) override
+        {
+            auto sb = dynamic_cast<SettingButton*> (btn);
+            if (midiInputs.contains (sb))
+            {
+                owner.midi.setMidiInputEnabled (inputs[midiInputs.indexOf (sb)],
+                                                btn->getToggleState());
+            }
+        }
+
+        void updateSelection()
+        {
+            for (auto* input : midiInputs)
+            {
+                int idx = midiInputs.indexOf (input);
+                input->setToggleState (owner.midi.isMidiInputEnabled (inputs[idx]), dontSendNotification);
+            }
+        }
+
+    private:
+        friend class MidiSettingsPage;
+        MidiSettingsPage& owner;
+        Array<MidiDeviceInfo> inputs;
+        OwnedArray<Label> midiInputLabels;
+        OwnedArray<SettingButton> midiInputs;
+    };
+
+    friend class MidiInputs;
+    std::unique_ptr<MidiInputs> midiInputs;
+    Viewport midiInputView;
+
+    void updateDevices()
+    {
+        outputs = MidiOutput::getAvailableDevices();
+        midiOutput.clear (dontSendNotification);
+        midiOutput.setTextWhenNoChoicesAvailable ("<none>");
+
+        int i = 0;
+        midiOutput.addItem ("<< none >>", 1);
+        midiOutput.addSeparator();
+        for (const auto& d : outputs)
+        {
+            midiOutput.addItem (d.name, 10 + i);
+            ++i;
+        }
+
+        midiInputs->updateDevices();
+
+        updateInputSelection();
+        updateOutputSelection();
+
+        resized();
+    }
+
+    void updateOutputSelection()
+    {
+        if (auto* out = midi.getDefaultMidiOutput())
+            midiOutput.setSelectedId (10 + outputs.indexOf (out->getDeviceInfo()));
+        else
+            midiOutput.setSelectedId (1);
+    }
+
+    void updateInputSelection()
+    {
+        if (midiInputs)
+            midiInputs->updateSelection();
+    }
+};
+
+//==============================================================================
+#if ELEMENT_UPDATER
+class UpdatesSettingsPage : public SettingsPage,
+                            public Button::Listener,
+                            public ComboBox::Listener,
+                            public juce::ChangeListener
+{
+public:
+    UpdatesSettingsPage (Context& w)
+        : world (w)
+    {
+        world.settings().addChangeListener (this);
+        addAndMakeVisible (releaseChannelLabel);
+        releaseChannelLabel.setText ("Release Channel", dontSendNotification);
+        releaseChannelLabel.setFont (Font (FontOptions (12.0, Font::bold)));
+
+        addAndMakeVisible (releaseChannelBox);
+        releaseChannelBox.addItem ("Stable", 1);
+        releaseChannelBox.addItem ("Preview", 2);
+        // ID 3 is reserved for a future "Testing" channel.
+
+        // Restore the persisted channel selection (defaults to stable).
+        const auto savedSlug = world.settings().getUpdateChannel();
+        releaseChannelBox.setSelectedId (channelIdForSlug (savedSlug), dontSendNotification);
+        releaseChannelBox.addListener (this);
+
+        addAndMakeVisible (authorizationLabel);
+        authorizationLabel.setText ("Preview Access", dontSendNotification);
+        authorizationLabel.setFont (Font (FontOptions (15.0f).withStyle ("Bold")));
+
+        addAndMakeVisible (statusLabel);
+        statusLabel.setText ("Not authorized", dontSendNotification);
+        statusLabel.setFont (Font (FontOptions (12.0)));
+        statusLabel.setColour (Label::textColourId, Colours::grey);
+
+        addAndMakeVisible (authorizeButton);
+        authorizeButton.setButtonText ("Sign in with Kushview.net");
+        authorizeButton.addListener (this);
+
+        addAndMakeVisible (signOutButton);
+        signOutButton.setButtonText ("Sign Out");
+        signOutButton.addListener (this);
+        signOutButton.setVisible (false);
+
+        updateAuthorizationState();
+    }
+
+    ~UpdatesSettingsPage()
+    {
+        world.settings().removeChangeListener (this);
+        releaseChannelBox.removeListener (this);
+        authorizeButton.removeListener (this);
+        signOutButton.removeListener (this);
+    }
+
+    void changeListenerCallback (juce::ChangeBroadcaster*) override
+    {
+        updateAuthorizationState();
+    }
+
+    void comboBoxChanged (ComboBox* box) override
+    {
+        if (box != &releaseChannelBox)
+            return;
+
+        const auto slug = channelSlugForId (releaseChannelBox.getSelectedId());
+        world.settings().setUpdateChannel (slug);
+
+        if (auto* g = world.services().find<GuiService>())
+            g->applyStoredChannelToUpdater();
+    }
+
+    void buttonClicked (Button* button) override
+    {
+        if (button == &authorizeButton)
+        {
+            startOAuthFlow();
+        }
+        else if (button == &signOutButton)
+        {
+            signOut();
+        }
+    }
+
+    void resized() override
+    {
+        const int spacingBetweenSections = 6;
+        const int settingHeight = 22;
+
+        Rectangle<int> r (getLocalBounds());
+
+        // Release channel selector
+        auto r2 = r.removeFromTop (settingHeight);
+        releaseChannelLabel.setBounds (r2.removeFromLeft (getWidth() / 2));
+        releaseChannelBox.setBounds (r2.withSizeKeepingCentre (r2.getWidth(), settingHeight));
+
+        // Authorization section
+        r.removeFromTop (spacingBetweenSections * 2);
+        authorizationLabel.setBounds (r.removeFromTop (24));
+
+        r.removeFromTop (spacingBetweenSections);
+
+        // Status label
+        statusLabel.setBounds (r.removeFromTop (settingHeight));
+
+        // Buttons
+        r.removeFromTop (spacingBetweenSections);
+        auto buttonRow = r.removeFromTop (settingHeight);
+        authorizeButton.setBounds (buttonRow.removeFromLeft (180));
+        buttonRow.removeFromLeft (spacingBetweenSections);
+        signOutButton.setBounds (buttonRow.removeFromLeft (100));
+    }
+
+private:
+    Context& world;
+
+    Label releaseChannelLabel;
+    ComboBox releaseChannelBox;
+
+    Label authorizationLabel;
+    Label statusLabel;
+    TextButton authorizeButton;
+    TextButton signOutButton;
+
+    /** Converts a settings channel slug to its combo box item ID.
+        Add new channels both here and in the combo box initialiser.
+        @param slug  "stable", "preview", or a future slug
+        @return      Combo box ID (1 = Stable if slug is unrecognised) */
+    static int channelIdForSlug (const juce::String& slug)
+    {
+        if (slug == "preview")
+            return 2;
+        // if (slug == "testing") return 3;  // reserved for future use
+        return 1;
+    }
+
+    /** Returns the settings slug stored for a given combo box item ID. */
+    static juce::String channelSlugForId (int id)
+    {
+        switch (id)
+        {
+            case 2:
+                return "preview";
+            // case 3: return "testing";  // reserved for future use
+            default:
+                return "stable";
+        }
+    }
+
+    /** Initiates the OAuth authorization flow.
+        
+        Opens the user's default browser to kushview.net OAuth page.
+        The website will redirect back to the app via custom URL scheme
+        after successful authentication.
+     */
+    void startOAuthFlow()
+    {
+        const auto authUrl = auth::beginAuthorizationFlow (world.settings());
+        if (authUrl.isNotEmpty())
+            URL (authUrl).launchInDefaultBrowser();
+    }
+
+    /** Signs out the user and clears stored tokens. */
+    void signOut()
+    {
+        auth::signOut (world.settings());
+
+        // Revert the updater to the public stable feed.
+        if (auto* g = world.services().find<GuiService>())
+            g->applyStoredChannelToUpdater();
+
+        // updateAuthorizationState() is triggered automatically via changeListenerCallback.
+    }
+
+    /** Updates the UI to reflect current authorization state from Settings. */
+    void updateAuthorizationState()
+    {
+        const auto& settings = world.settings();
+        const auto accessToken = settings.getUpdateKey().trim();
+        const auto userDisplay = settings.getUpdateKeyUser().trim();
+        const bool authorized = accessToken.isNotEmpty();
+        const bool canPreview = authorized && settings.getAuthPreviewUpdates();
+
+        if (authorized)
+        {
+            const auto label = userDisplay.isNotEmpty() ? userDisplay : accessToken.substring (0, 12) + "...";
+            statusLabel.setText ("Authorized as: " + label, dontSendNotification);
+            statusLabel.setColour (Label::textColourId, Colours::green);
+            authorizeButton.setVisible (false);
+            signOutButton.setVisible (true);
+            releaseChannelBox.setItemEnabled (2, canPreview); // Preview requires entitlement
+        }
+        else
+        {
+            statusLabel.setText ("Not authorized", dontSendNotification);
+            statusLabel.setColour (Label::textColourId, Colours::grey);
+            authorizeButton.setVisible (true);
+            signOutButton.setVisible (false);
+            releaseChannelBox.setItemEnabled (2, false); // Disable Preview
+
+            // Revert to Stable if a non-public channel was selected.
+            if (releaseChannelBox.getSelectedId() != 1)
+            {
+                releaseChannelBox.setSelectedId (1, dontSendNotification);
+                world.settings().setUpdateChannel ("stable");
+                if (auto* g = world.services().find<GuiService>())
+                    g->applyStoredChannelToUpdater();
+            }
+        }
+    }
+};
+#endif
+
+//==============================================================================
+Preferences::Preferences (GuiService& ui)
+    : _context (ui.context()), _ui (ui)
+{
+    pageList = std::make_unique<PageList> (*this);
+    addAndMakeVisible (pageList.get());
+    pageList->setName ("PageList");
+
+    pageComponent = std::make_unique<Component>();
+    addAndMakeVisible (pageComponent.get());
+    pageComponent->setName ("Page");
+
+    updateSize();
+}
+
+Preferences::~Preferences()
+{
+    pageList = nullptr;
+    pageComponent = nullptr;
+    pages.clear();
+    _ui.refreshMainMenu();
+}
+
+//==============================================================================
+void Preferences::paint (Graphics& g)
+{
+    g.fillAll (Colors::widgetBackgroundColor);
+}
+
+void Preferences::resized()
+{
+    auto r = getLocalBounds().reduced (8);
+    pageList->setBounds (r.removeFromLeft (110));
+    if (pageComponent)
+        pageComponent->setBounds (r.reduced (8));
+}
+
+bool Preferences::keyPressed (const KeyPress& key)
+{
+    return false;
+}
+
+void Preferences::addPage (const String& name)
+{
+    if (! pageList->pageNames.contains (name))
+        pageList->addItem (name);
+}
+
+Component* Preferences::createPageForName (const String& name)
+{
+    if (name == ELEMENT_GENERAL_SETTINGS_NAME)
+    {
+        return new GeneralSettingsPage (_context, _ui);
+    }
+    else if (name == ELEMENT_AUDIO_SETTINGS_NAME)
+    {
+        return new AudioSettingsComponent (_context);
+    }
+    else if (name == ELEMENT_PLUGINS_PREFERENCE_NAME)
+    {
+        return new PluginSettingsComponent (_context);
+    }
+    else if (name == ELEMENT_MIDI_SETTINGS_NAME)
+    {
+        return new MidiSettingsPage (_context);
+    }
+    else if (name == ELEMENT_OSC_SETTINGS_NAME)
+    {
+        return new OSCSettingsPage (_context, _ui);
+    }
+#if ELEMENT_UPDATER
+    else if (name == ELEMENT_REPOSITORY_PREFERENCE_NAME)
+    {
+        return new UpdatesSettingsPage (_context);
+    }
+#endif
+    return nullptr;
+}
+
+void Preferences::addDefaultPages()
+{
+    if (pageList->getNumRows() > 0)
+        return;
+
+    addPage (ELEMENT_GENERAL_SETTINGS_NAME);
+    addPage (ELEMENT_AUDIO_SETTINGS_NAME);
+    addPage (ELEMENT_MIDI_SETTINGS_NAME);
+#if ! ELEMENT_SE
+    addPage (ELEMENT_OSC_SETTINGS_NAME);
+#endif
+#if ELEMENT_UPDATER
+    addPage (ELEMENT_REPOSITORY_PREFERENCE_NAME);
+#endif
+
+    setPage (ELEMENT_GENERAL_SETTINGS_NAME);
+}
+
+void Preferences::setPage (const String& name)
+{
+    if (nullptr != pageComponent && name == pageComponent->getName())
+        return;
+
+    if (pageComponent)
+    {
+        removeChildComponent (pageComponent.get());
+    }
+
+    pageComponent.reset (createPageForName (name));
+
+    if (pageComponent)
+    {
+        pageComponent->setName (name);
+        addAndMakeVisible (pageComponent.get());
+        pageList->selectRow (pageList->indexOfPage (name));
+    }
+    else
+    {
+        pageComponent = std::make_unique<Component> (name);
+    }
+    resized();
+}
+
+void Preferences::updateSize()
+{
+    setSize (600, 500);
+}
+
+} /* namespace element */

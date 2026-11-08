@@ -1,0 +1,139 @@
+# SPDX-FileCopyrightText: 2026 Kushview, LLC
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Element static library
+add_library(element STATIC)
+add_library(kv::element ALIAS element)
+
+set_target_properties(element PROPERTIES 
+    POSITION_INDEPENDENT_CODE ON
+    CXX_VISIBILITY_PRESET hidden
+    C_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
+)
+
+target_include_directories(element
+    PUBLIC
+        "${GENERATED_INCLUDE_DIR}"
+        "${PROJECT_SOURCE_DIR}/include"
+        "${PROJECT_SOURCE_DIR}/src"
+        "${PROJECT_SOURCE_DIR}/src/lua/sol"
+        "${PROJECT_SOURCE_DIR}/src/lua/src"
+        "${PROJECT_SOURCE_DIR}/deps/clap-juce-extensions/clap-libs/clap/include"
+        "${PROJECT_SOURCE_DIR}/deps/clap-juce-extensions/clap-libs/clap-helpers/include"
+        "${Boost_INCLUDE_DIRS}"       
+)
+
+file(GLOB_RECURSE ELEMENT_SOURCES 
+    "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp" 
+    "${CMAKE_CURRENT_SOURCE_DIR}/*.c")
+
+target_sources(element PRIVATE ${ELEMENT_SOURCES})
+
+if(APPLE)
+    target_sources(element PRIVATE 
+        "${CMAKE_CURRENT_SOURCE_DIR}/ui/nsviewwithparent.mm"
+        "${CMAKE_CURRENT_SOURCE_DIR}/urlhandler.mm"
+    )
+endif()
+
+target_compile_definitions(element 
+    PUBLIC BOOST_ALL_NO_LIB=1)
+
+target_compile_options(element PRIVATE ${SUIL_CFLAGS_OTHER})
+
+if(JACK_FOUND)
+    message(STATUS "JACK audio driver enabled")
+    target_compile_definitions(element PUBLIC ELEMENT_USE_JACK=1)
+    target_include_directories(element PUBLIC ${JACK_INCLUDE_DIRS})
+endif()
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+    target_compile_options(element PRIVATE -Wno-sign-conversion -Wno-switch-enum -Wno-attributes)
+elseif(MSVC)
+    # MSVC doesn't support -Wno-sign-conversion; disable a relevant warning if needed
+    # e.g. /wd4244 or /wd4267 depending on the warning you want to suppress
+    target_compile_options(element PRIVATE /wd4244)
+endif()
+
+
+target_compile_definitions(element
+    PUBLIC
+        JUCE_MODAL_LOOPS_PERMITTED=1
+        JUCE_WEB_BROWSER=0
+        JUCE_USE_CURL=1
+        JUCE_USE_XRENDER=1
+        JUCE_LOAD_CURL_SYMBOLS_LAZILY=1
+        JUCE_PLUGINHOST_LV2=1
+        JUCE_PLUGINHOST_VST3=1
+        JUCE_PLUGINHOST_AU=1
+        JUCE_VST3_CAN_REPLACE_VST2=0)
+
+target_link_libraries(element
+    PUBLIC
+        juce::juce_core
+        juce::juce_cryptography
+        juce::juce_gui_basics
+        juce::juce_gui_extra
+        juce::juce_osc
+        juce::juce_dsp
+        juce::juce_data_structures
+        juce::juce_audio_basics
+        juce::juce_audio_devices
+        juce::juce_audio_processors
+        juce::juce_audio_formats
+        juce::juce_audio_utils
+        juce::juce_recommended_config_flags
+        element-binarydata
+        element-luascripts
+        element-luamods
+        sol2::sol2
+    )
+
+if(ELEMENT_ENABLE_UPDATER)
+    message(STATUS "Element updater enabled")
+    target_compile_definitions(element PUBLIC ELEMENT_UPDATER=1)
+endif()
+
+if(ELEMENT_LOCAL_AUTH)
+    message(STATUS "Element local auth endpoints enabled")
+    target_compile_definitions(element PRIVATE ELEMENT_LOCAL_AUTH=1)
+endif()
+
+if(ELEMENT_ENABLE_LTO)
+    message("Link Time Optimization enabled")
+    target_link_libraries(element PUBLIC juce::juce_recommended_lto_flags)
+endif()
+
+if(WIN32 AND ELEMENT_ENABLE_ASIO)
+    message("ASIO audio device support enabled")
+    target_include_directories(element PUBLIC "${ASIOSDK_SOURCE_DIR}/common")
+    target_compile_definitions(element PUBLIC JUCE_ASIO=1)
+endif()
+
+# VST2 enable host support
+if(ELEMENT_ENABLE_VST2)
+    message(STATUS "VST2 Plugin support enabled")
+    juce_set_vst2_sdk_path("${ELEMENT_VST2_SDK_PATH}")
+    target_compile_definitions(element PUBLIC JUCE_PLUGINHOST_VST=1)
+    target_link_libraries(element PUBLIC juce_vst2_sdk)
+
+    # jBridge support (Windows only): force-include the jBridge macro definitions
+    # before JUCE compiles its VST2 hosting code. Applied to the JUCE module
+    # target so every consumer compiling the module sources gets the macros.
+    if(WIN32)
+        set(JBRIDGE_HEADER "${PROJECT_SOURCE_DIR}/src/juce/jbridge.cpp")
+        if(MSVC)
+            target_compile_options(juce_audio_processors INTERFACE "/FI${JBRIDGE_HEADER}")
+        else()
+            target_compile_options(juce_audio_processors INTERFACE "-include" "${JBRIDGE_HEADER}")
+        endif()
+    endif()
+endif()
+
+# MSVC 14.44+ constexpr mutex constructor workaround (debug only).
+# See CMakeLists.txt in the root for explanation.
+if(MSVC)
+    target_compile_definitions(element PRIVATE
+        $<$<CONFIG:Debug>:_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR>)
+endif()
