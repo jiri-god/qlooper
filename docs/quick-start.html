@@ -1,0 +1,98 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><title>QLooper RC1 - Quick start</title><style>body{font:17px/1.55 system-ui,sans-serif;color:#202a35;max-width:850px;margin:40px auto;padding:0 24px}h1,h2{line-height:1.2}h1{color:#17657d}h2{margin-top:32px}li{margin:8px 0}a{color:#17657d}@media print{body{font-size:11pt;margin:0}h2{break-after:avoid}li{break-inside:avoid}}</style><body><h1>QLooper RC1 — your first loop</h1>
+<p>QLooper includes a modified Element host. You do <strong>not</strong> need a separate Element
+installation. Some menus and internal nodes still use the Element name.</p>
+<h2>1. Install and select your audio device</h2>
+<ol>
+<li>Open the DMG and drag <strong>QLooper.app</strong> to <strong>Applications</strong>. Eject the DMG and
+   open the copied app. Use this build: stock Element does not contain our nodes.
+   Choose the Apple Silicon build. macOS 14 is the build minimum; RC1 has been
+   tested locally on macOS 26, not on every older macOS release.</li>
+<li>This initial RC1 is not notarized. If macOS blocks it, follow Apple's
+   <a href="https://support.apple.com/en-us/102445">Open Anyway procedure</a> in
+   <strong>System Settings → Privacy &amp; Security</strong>, after verifying the download source.
+   Do not disable Gatekeeper globally.</li>
+<li>Allow microphone/audio-input access when requested. Double-click the device
+   status at the bottom of the main window to open audio settings, then choose
+   your audio interface for input and output; enable the channels you use.</li>
+<li>Start at <strong>44.1 or 48 kHz</strong>, <strong>128 or 256 samples</strong>. Use headphones for microphone
+   tests to avoid acoustic feedback. Start with output volume low.</li>
+</ol>
+<h2>2. Add and connect a Looper</h2>
+<ol>
+<li>Create a new session/graph. Show the <strong>Plugins</strong> panel, find <strong>Looper</strong> among
+   the built-in Element nodes and drag it into the graph. The Plugins panel is
+   in the left sidebar; View → Plugin Manager also lists the available modules.
+   The expected names are Looper, Looper Manager and Song Manager. No plugin scan is
+   required for our built-in nodes.</li>
+<li>Connect <strong>Audio In → Looper → Audio Out</strong>. For a mono instrument, connect its
+   input channel to both Looper input channels to hear it in both ears. Connect
+   Looper left/right outputs to the output pair feeding your headphones/speakers.</li>
+<li>Double-click the Looper to open its full editor. <strong>Monitor</strong> enables hearing
+   the live input; <strong>Mute</strong> silences recorded loops; <strong>Bypass</strong> passes input through.</li>
+<li>For a first test select <strong>Settings → General → Mode → Free</strong>. In
+   <strong>Settings → Recording</strong>, set the Overdub start timing to <strong>Now</strong> for this
+   first test; leave <strong>Stop after</strong> off. Close Settings to return to the controls.</li>
+<li>Click <strong>Overdub</strong> to start the first recording; click again to finish it and
+   hear it repeat. Click Overdub again to add another layer, then again to finish.</li>
+<li><strong>Play/Stop</strong> toggles playback. <strong>Undo/Redo</strong> works on an entire recording/One
+   Take. Record has its own configurable behaviour; inspect Settings → Recording
+   before using it on material you want to keep.</li>
+<li><strong>File → Save As</strong> saves your session and layers. Keep a backup before tests.</li>
+</ol>
+<p>When the looper editor has keyboard focus and you are not editing text:
+<strong>A</strong> = Overdub, <strong>S</strong> = Record, <strong>D</strong> = Play/Stop, <strong>Z/X</strong> = Undo/Redo.
+The labels in the current editor show the shortcuts. MIDI is optional.</p>
+<h2>3. Work with layers and timing</h2>
+<ul>
+<li>Layers have volume/pan, Add/Replace, On, Solo and No FB (ignore feedback).
+  The waveform shows the recorded audio, independent of its current volume.</li>
+<li><strong>Layers…</strong> opens the larger window. Select a waveform for a larger preview.</li>
+<li><strong>Import</strong> loads prepared audio; files are resampled as needed, not time-stretched.</li>
+<li><strong>Sync</strong> follows rig tempo; <strong>Fixed bars</strong> sets the initial loop length in bars.
+  Configure start/count-in separately for Record, Overdub and the custom profiles.</li>
+<li>Hover a control for a short explanation. In Settings, <strong>?</strong> opens detailed help.</li>
+</ul>
+<h2>4. Add a Looper Manager</h2>
+<ol>
+<li>Add another Looper and a <strong>Looper Manager</strong> from the built-in nodes.</li>
+<li>Wire the Manager's <strong>MIDI output to each Looper's MIDI input</strong> in that graph.
+   Connect the hardware MIDI input to the Manager if you use shared pedals.</li>
+<li>Open the Manager. Its boxes control individual loopers; <strong>Play All / Stop All</strong>
+   control the group. <strong>Active</strong> identifies the looper receiving shared commands.</li>
+<li>Drag a compatible looper's header into <strong>Master</strong>; assign other loopers to
+   <strong>Linked</strong> or leave them <strong>Independent</strong>. Linking has compatibility/recording
+   restrictions and never means automatic time-stretching of imported audio.</li>
+<li>Assign your controller in <strong>Settings → MIDI</strong>. Hold actions need both press
+   and release messages (for example MIDI CC values 127 and 0).</li>
+</ol>
+<h2>5. Sections and the combined view</h2>
+<ul>
+<li>Prepare section graphs (for example Verse and Chorus), with their audio paths
+  connected to the parent graph. Each can contain its own Looper Manager/effects.</li>
+<li>Add <strong>Song Manager</strong> at the parent level. Add the prepared sections to its list
+  in the order you need. Next section uses its timing settings; a double-click on
+  a section switches immediately. <strong>Panic</strong> silences the song; <strong>Restore audio</strong>
+  restores sound without restarting stopped loops.</li>
+<li>Open <strong>Window → Looper View</strong>. It brings Song Manager, Looper Manager, the shown
+  Looper and layers together. Missing modules are shown as empty areas.</li>
+<li>The arrows above the looper change the <strong>displayed</strong> looper. Use the Manager
+  to change MIDI/pedal control. Split / Loopers / Layers changes the space allocation.</li>
+</ul>
+<h2>Optional effects, tuner and metronome</h2>
+<p>Add your own compatible AU/VST3/LV2 effects in Element's plugin panel and route
+<strong>Audio In → effect → Looper → Audio Out</strong> to record that effect, or put effects
+after the looper to process playback. Install/scan external plugins separately.</p>
+<p>The compact tuner integration expects x42 Instrument Tuner and our optional
+compact UI. TICK is an external metronome; neither binary is included in this
+first DMG. The top Metronome checkbox controls a matching TICK node when present.
+Looping itself needs neither plugin. Keep metronome audio on a separate output
+path if you do not want it recorded in the loop.</p>
+<h2>If there is no sound</h2>
+<ul>
+<li>Check audio device, enabled channels and cables from input through to output.</li>
+<li>Check Monitor, Mute, Bypass, mixer level and Song Manager's active section/Panic.</li>
+<li>Rig transport and loop playback are separate controls; transport Play alone
+  does not necessarily play a stopped loop.</li>
+<li>For a useful bug report: include RC1 version, macOS, device, sample rate/buffer,
+  exact actions and whether the fault is audible in a Recorder capture.</li>
+</ul></body></html>

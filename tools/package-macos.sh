@@ -11,7 +11,8 @@ stage=$(mktemp -d "${TMPDIR:-/tmp}/qlooper-dmg.XXXXXX")
 trap 'rm -rf "$stage"' EXIT
 ditto "$app" "$stage/QLooper.app"
 mkdir -p "$stage/Documentation" "$stage/QLooper.app/Contents/Resources/Licenses"
-cp "$root/docs/quick-start.md" "$root/docs/rc1-notes.md" "$stage/Documentation/"
+cp "$root/docs/quick-start.md" "$root/docs/quick-start.html" "$root/docs/QLooper-Quick-Start.pdf" "$root/docs/rc1-notes.md" "$stage/Documentation/"
+cp "$root/docs/QLooper-Quick-Start.pdf" "$stage/Start here.pdf"
 cp "$root/LICENSE" "$root/LICENSING.md" "$root/THIRD-PARTY-NOTICES.md" "$stage/Documentation/"
 ditto "$root/LICENSES" "$stage/QLooper.app/Contents/Resources/Licenses"
 printf '[InternetShortcut]\nURL=https://github.com/jiri-god/qlooper\n' > "$stage/Source code.url"

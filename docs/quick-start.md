@@ -7,11 +7,14 @@ installation. Some menus and internal nodes still use the Element name.
 
 1. Open the DMG and drag **QLooper.app** to **Applications**. Eject the DMG and
    open the copied app. Use this build: stock Element does not contain our nodes.
+   Choose the Apple Silicon build. macOS 14 is the build minimum; RC1 has been
+   tested locally on macOS 26, not on every older macOS release.
 2. This initial RC1 is not notarized. If macOS blocks it, follow Apple's
    [Open Anyway procedure](https://support.apple.com/en-us/102445) in
    **System Settings → Privacy & Security**, after verifying the download source.
    Do not disable Gatekeeper globally.
-3. Allow microphone/audio-input access. Open the app's audio settings and choose
+3. Allow microphone/audio-input access when requested. Double-click the device
+   status at the bottom of the main window to open audio settings, then choose
    your audio interface for input and output; enable the channels you use.
 4. Start at **44.1 or 48 kHz**, **128 or 256 samples**. Use headphones for microphone
    tests to avoid acoustic feedback. Start with output volume low.
@@ -19,7 +22,9 @@ installation. Some menus and internal nodes still use the Element name.
 ## 2. Add and connect a Looper
 
 1. Create a new session/graph. Show the **Plugins** panel, find **Looper** among
-   the built-in Element nodes and drag it into the graph. No plugin scan is
+   the built-in Element nodes and drag it into the graph. The Plugins panel is
+   in the left sidebar; View → Plugin Manager also lists the available modules.
+   The expected names are Looper, Looper Manager and Song Manager. No plugin scan is
    required for our built-in nodes.
 2. Connect **Audio In → Looper → Audio Out**. For a mono instrument, connect its
    input channel to both Looper input channels to hear it in both ears. Connect
@@ -27,7 +32,8 @@ installation. Some menus and internal nodes still use the Element name.
 3. Double-click the Looper to open its full editor. **Monitor** enables hearing
    the live input; **Mute** silences recorded loops; **Bypass** passes input through.
 4. For a first test select **Settings → General → Mode → Free**. In
-   **Settings → Recording**, leave the Overdub preparation/Wait for sound off.
+   **Settings → Recording**, set the Overdub start timing to **Now** for this
+   first test; leave **Stop after** off. Close Settings to return to the controls.
 5. Click **Overdub** to start the first recording; click again to finish it and
    hear it repeat. Click Overdub again to add another layer, then again to finish.
 6. **Play/Stop** toggles playback. **Undo/Redo** works on an entire recording/One

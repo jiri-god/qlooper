@@ -45,7 +45,7 @@ SPDX-FileCopyrightText = "2026 jiri-god"
 SPDX-License-Identifier = "CC0-1.0"
 
 [[annotations]]
-path = [ "README.md", "LICENSING.md", "CONTRIBUTING.md", "THIRD-PARTY-NOTICES.md", "docs/building.md", "docs/quick-start.md", "docs/rc1-notes.md", ".github/workflows/macos.yml" ]
+path = [ "README.md", "LICENSING.md", "CONTRIBUTING.md", "THIRD-PARTY-NOTICES.md", "docs/building.md", "docs/quick-start.md", "docs/rc1-notes.md", "docs/quick-start.html", "docs/QLooper-Quick-Start.pdf", ".github/workflows/macos.yml" ]
 precedence = "override"
 SPDX-FileCopyrightText = "2026 QLooper contributors"
 SPDX-License-Identifier = "CC0-1.0"

@@ -42,3 +42,5 @@ scope, dependency notices, source availability and the future licensing boundary
 Original Element contributors retain their copyrights; see AUTHORS.md. This
 repository starts from a curated source snapshot, excluding private recordings,
 credentials, local settings and development history.
+
+Printable guide: [Quick start PDF](docs/QLooper-Quick-Start.pdf). An offline HTML version is included in the DMG.
