@@ -39,7 +39,7 @@ installation. Some menus and internal nodes still use the Element name.
 6. **Play/Stop** toggles playback. **Undo/Redo** works on an entire recording/One
    Take. Record has its own configurable behaviour; inspect Settings → Recording
    before using it on material you want to keep.
-7. **File → Save As** saves your session and layers. Keep a backup before tests.
+7. **File → Save Session As...** saves your session and layers. Keep a backup before tests.
 
 When the looper editor has keyboard focus and you are not editing text:
 **A** = Overdub, **S** = Record, **D** = Play/Stop, **Z/X** = Undo/Redo.
