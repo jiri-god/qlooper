@@ -12,7 +12,7 @@ namespace {
 using Action = LooperManagerNode::BoxAction;
 String profileName(int index) { return StringArray{"Record", "Overdub", "Custom 1", "Custom 2"}[jlimit(0,3,index)]; }
 void addProfiles(ComboBox& box) { for(int i=0;i<4;++i)box.addItem(profileName(i),i+1); }
-void addTiming(ComboBox& box) {box.addItem("Now",1);box.addItem("Next bar",2);box.addItem("Count-in",3);}
+void addTiming(ComboBox& box) {box.addItem("Now",1);box.addItem("Count-in",3);}
 Colour stateColour(const LooperProcessor::View& v) {
     return v.state==1 || v.state==4 || v.state==5 || v.armed ? Colours::orange
         : v.state==2 ? Colours::lightgreen : Colours::lightgrey;
@@ -229,7 +229,7 @@ struct LooperManagerEditor::Impl final : Component, Timer, DragAndDropContainer 
     struct SettingsPanel final : Component, ListBoxModel {
         Impl& ui;
         Label managerNameLabel,managerNameCount;TextEditor managerName;
-        Label orderTitle, navTitle, orderLabel, shortLabel, longLabel, profileLabel, shortBarsLabel,longBarsLabel,help;
+        Label orderTitle, navTitle, orderLabel, shortLabel, longLabel, profileLabel, shortBarsLabel,longBarsLabel,shortHint,longHint,help;
         ListBox order {"Looper order",this};
         std::vector<uint32> orderIds;StringArray orderNames;
         ComboBox shortTiming,longTiming,navProfile,longProfile;
@@ -270,7 +270,7 @@ struct LooperManagerEditor::Impl final : Component, Timer, DragAndDropContainer 
         std::vector<std::unique_ptr<Label>> memberTitles;
         std::vector<std::unique_ptr<MappingRow>> mappings;
         SettingsPanel(Impl& u):ui(u){
-            for(Component* c:std::initializer_list<Component*>{&managerNameLabel,&managerNameCount,&managerName,&orderTitle,&navTitle,&orderLabel,&shortLabel,&longLabel,&profileLabel,&shortBarsLabel,&longBarsLabel,&help,&order,&shortTiming,&longTiming,&navProfile,&longProfile,&longProfileLabel,&shortSwitch,&longSwitch,&first,&last,&up,&down,&reset,&shortBars,&longBars})addAndMakeVisible(c);
+            for(Component* c:std::initializer_list<Component*>{&managerNameLabel,&managerNameCount,&managerName,&orderTitle,&navTitle,&orderLabel,&shortLabel,&longLabel,&profileLabel,&shortBarsLabel,&longBarsLabel,&shortHint,&longHint,&help,&order,&shortTiming,&longTiming,&navProfile,&longProfile,&longProfileLabel,&shortSwitch,&longSwitch,&first,&last,&up,&down,&reset,&shortBars,&longBars})addAndMakeVisible(c);
             managerName.setTooltip("Name this Manager in the rig. Custom names are limited to 12 characters; the default QLooper Manager name is exempt. Enter or leaving the field applies the name; an empty name is ignored.");managerNameLabel.setTooltip(managerName.getTooltip());
             managerName.setComponentID("manager-name");managerLabel(managerNameLabel,"Name");
             const auto rename=[this]{auto value=managerName.getText().trim();if(value.isNotEmpty())ui.owner.getNode().setProperty(tags::name,value);};
@@ -278,13 +278,13 @@ struct LooperManagerEditor::Impl final : Component, Timer, DragAndDropContainer 
             managerName.onReturnKey=rename;managerName.onFocusLost=rename;
             managerLabel(orderTitle,"LOOPER ORDER");managerLabel(navTitle,"MIDI LOOPER SWITCHING");managerLabel(orderLabel,"Looper");
             managerLabel(shortLabel,"Short press");managerLabel(longLabel,"Long press");managerLabel(profileLabel,"Recording action");managerLabel(longProfileLabel,"Recording action");
-            managerLabel(shortSwitch,"Switch");managerLabel(longSwitch,"Switch");managerLabel(shortBarsLabel,"Count-in bars");managerLabel(longBarsLabel,"Count-in bars");
+            managerLabel(shortSwitch,"Switch");managerLabel(longSwitch,"Switch");managerLabel(shortBarsLabel,"Count-in");managerLabel(longBarsLabel,"Count-in");managerLabel(shortHint,"1 = Next bar");managerLabel(longHint,"1 = Next bar");
             addTiming(shortTiming);addTiming(longTiming);
             for(auto* box:{&navProfile,&longProfile}){box->addItem("None",1);for(int i=0;i<4;++i)box->addItem(profileName(i),i+2);box->setTooltip("Invoke the target looper recording profile. None switches only.");}
             order.setTooltip("Set the order used by Previous and Next. Select a looper, then move it with Top, Up, Down or Bottom. This order does not alter cables, audio layers or master relationships. Reordering is locked while capture is pending or active.");
             orderTitle.setTooltip(order.getTooltip());
             for(auto* button:{&first,&last,&up,&down})button->setTooltip("Move the selected looper in the navigation order. Audio routing and recorded layers are unchanged.");
-            const String switchHelp="Choose when the target looper becomes active. Now switches immediately. Next bar waits for the next rig bar; Count-in adds the chosen complete bars. Timed switching requires a running rig clock. This timing is separate from any recording delay in the target profile.";
+            const String switchHelp="Choose when the target looper becomes active. Now switches immediately. Count-in counts upcoming bar boundaries: 1 = Next bar, 2 = one complete bar later. Timed switching requires a running rig clock. This timing is separate from any recording delay in the target profile.";
             shortTiming.setTooltip(switchHelp);longTiming.setTooltip(switchHelp);shortSwitch.setTooltip(switchHelp);longSwitch.setTooltip(switchHelp);
             shortLabel.setTooltip("Settings for a short Previous/Next MIDI press, recognized on release. The default selects a neighbour and invokes its Overdub profile. Choose None to select without recording.");
             longLabel.setTooltip("Settings for a Previous/Next MIDI hold of 0.8 seconds. The default only selects a neighbour. The on-screen Prev/Next buttons always select only, using this Long press timing even if its MIDI recording action is configured.");
@@ -292,15 +292,15 @@ struct LooperManagerEditor::Impl final : Component, Timer, DragAndDropContainer 
             for(auto* box:{&navProfile,&longProfile})box->setTooltip(profileHelp);
             profileLabel.setTooltip(profileHelp);longProfileLabel.setTooltip(profileHelp);
             order.setRowHeight(26);
-            shortTiming.onChange=[this]{ui.manager.shortTiming=shortTiming.getSelectedId()-1;};longTiming.onChange=[this]{ui.manager.longTiming=longTiming.getSelectedId()-1;};
+            shortTiming.onChange=[this]{ui.manager.shortTiming=shortTiming.getSelectedId()==1?0:shortBars.getValue()==1?1:2;};longTiming.onChange=[this]{ui.manager.longTiming=longTiming.getSelectedId()==1?0:longBars.getValue()==1?1:2;};
             navProfile.onChange=[this]{ui.manager.navigationProfile=navProfile.getSelectedId()-2;};
             longProfile.onChange=[this]{ui.manager.longProfile=longProfile.getSelectedId()-2;};
-            for(auto* s:{&shortBars,&longBars}){managerNumber(*s,"Number of bars before switching. The target recording profile may then wait separately.");s->setRange(1,32,1);}
+            for(auto* s:{&shortBars,&longBars}){managerNumber(*s,"Upcoming boundaries before switching (1 = Next bar). The target recording profile may then wait separately.");s->setRange(1,33,1);}
             shortBarsLabel.setTooltip(shortBars.getTooltip());longBarsLabel.setTooltip(longBars.getTooltip());
-            shortBars.setTooltip("Extra complete bars after the next bar boundary. Used only with Count-in for a short navigation press. The target recording profile may add its own preparation after switching.");
-            longBars.setTooltip("Extra complete bars after the next bar boundary. Used only with Count-in for a long navigation press or on-screen Prev/Next. The target recording profile may add its own preparation after switching.");
+            shortBars.setTooltip("Upcoming bar boundaries: 1 = Next bar, 2 = one full bar later. Used only with Count-in for a short navigation press. The target recording profile may add its own preparation after switching.");
+            longBars.setTooltip("Upcoming bar boundaries: 1 = Next bar, 2 = one full bar later. Used only with Count-in for a long navigation press or on-screen Prev/Next. The target recording profile may add its own preparation after switching.");
             shortBarsLabel.setTooltip(shortBars.getTooltip());longBarsLabel.setTooltip(longBars.getTooltip());
-            shortBars.onValueChange=[this]{ui.manager.shortBars=int(shortBars.getValue());};longBars.onValueChange=[this]{ui.manager.longBars=int(longBars.getValue());};
+            shortBars.onValueChange=[this]{ui.manager.shortBars=std::max(1,int(shortBars.getValue())-1);if(ui.manager.shortTiming.load()!=0)ui.manager.shortTiming=shortBars.getValue()==1?1:2;};longBars.onValueChange=[this]{ui.manager.longBars=std::max(1,int(longBars.getValue())-1);if(ui.manager.longTiming.load()!=0)ui.manager.longTiming=longBars.getValue()==1?1:2;};
             up.onClick=[this]{moveSelected(-1);};down.onClick=[this]{moveSelected(1);};first.onClick=[this]{moveSelected(-int(orderIds.size()));};last.onClick=[this]{moveSelected(int(orderIds.size()));};
             reset.onClick=[this]{Component::SafePointer<SettingsPanel> safe(this);AlertWindow::showOkCancelBox(MessageBoxIconType::WarningIcon,"Reset all loopers?","Erase all layers, undo history and fixed lengths? Routing, MIDI and sync settings are kept.","Reset all","Cancel",this,ModalCallbackFunction::create([safe](int result){if(result&&safe)safe->ui.manager.resetAll();}));};
             reset.setTooltip("Erase recordings and reset loop lengths in every managed looper after confirmation. Undo history is erased too. Routing, MIDI mappings and sync assignments remain; a new first master recording can define the structure again.");
@@ -334,10 +334,10 @@ struct LooperManagerEditor::Impl final : Component, Timer, DragAndDropContainer 
         void refresh(){
             if(!managerName.hasKeyboardFocus(true))managerName.setText(ui.owner.getNode().getName(),false);managerNameCount.setText(managerName.getText()=="QLooper Manager"?String("Default"):String(managerName.getText().length())+"/12",dontSendNotification);
             const bool locked=ui.manager.isLocked();for(Component* c:std::initializer_list<Component*>{&order,&first,&last,&up,&down,&longProfile,&shortTiming,&longTiming,&shortBars,&longBars,&navProfile})c->setEnabled(!locked);
-            shortTiming.setSelectedId(ui.manager.shortTiming.load()+1,dontSendNotification);longTiming.setSelectedId(ui.manager.longTiming.load()+1,dontSendNotification);
+            shortTiming.setSelectedId(ui.manager.shortTiming.load()==0?1:3,dontSendNotification);longTiming.setSelectedId(ui.manager.longTiming.load()==0?1:3,dontSendNotification);
             navProfile.setSelectedId(ui.manager.navigationProfile.load()+2,dontSendNotification);
             longProfile.setSelectedId(ui.manager.longProfile.load()+2,dontSendNotification);
-            shortBars.setValue(ui.manager.shortBars.load(),dontSendNotification);longBars.setValue(ui.manager.longBars.load(),dontSendNotification);
+            shortBars.setValue(ui.manager.shortTiming.load()==1?1:ui.manager.shortBars.load()+1,dontSendNotification);longBars.setValue(ui.manager.longTiming.load()==1?1:ui.manager.longBars.load()+1,dontSendNotification);
             shortBars.setEnabled(!locked&&shortTiming.getSelectedId()==3);longBars.setEnabled(!locked&&longTiming.getSelectedId()==3);
             for(int i=0;i<5;++i){values[i].setValue(navValue(i).load(),dontSendNotification);if(i<4)assigns[i].setButtonText(ui.manager.learn.load()==i+1?"Cancel":"Assign");}
             for(auto& row:mappings)row->refresh();
@@ -353,7 +353,7 @@ struct LooperManagerEditor::Impl final : Component, Timer, DragAndDropContainer 
                 for(auto* button:{&first,&up,&down,&last})show(*button,moves.removeFromTop(33).reduced(2));
                 r.removeFromTop(12);show(navTitle,r.removeFromTop(28));
                 for(int i=0;i<2;++i){
-                    show(i?longLabel:shortLabel,r.removeFromTop(24));auto row=r.removeFromTop(34);show(i?longSwitch:shortSwitch,row.removeFromLeft(60));show(i?longTiming:shortTiming,row.removeFromLeft(150).reduced(2));show(i?longBarsLabel:shortBarsLabel,row.removeFromLeft(105));show(i?longBars:shortBars,row.removeFromLeft(65).reduced(2));
+                    show(i?longLabel:shortLabel,r.removeFromTop(24));auto row=r.removeFromTop(34);show(i?longSwitch:shortSwitch,row.removeFromLeft(60));show(i?longTiming:shortTiming,row.removeFromLeft(150).reduced(2));show(i?longBarsLabel:shortBarsLabel,row.removeFromLeft(70));show(i?longBars:shortBars,row.removeFromLeft(65).reduced(2));show(i?longHint:shortHint,row);
                     row=r.removeFromTop(34);show(i?longProfileLabel:profileLabel,row.removeFromLeft(150));show(i?longProfile:navProfile,row.removeFromLeft(160).reduced(2));r.removeFromTop(8);
                 }
                 r.removeFromTop(12);show(reset,r.removeFromTop(34).removeFromLeft(220));

@@ -1,0 +1,1 @@
+Current A1 JGOD only, read 2026-11-10. Preset LEDs included; A2 and Global Config excluded. Original A1/A2 and full readbacks retained under sources/pacer-reference.

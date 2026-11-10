@@ -65,7 +65,7 @@ BOOST_AUTO_TEST_CASE(WaitIgnoresOtherControllerSameCancelsAndSettingsLock)
     auto c=p.recordingControl(1);c.bars=3;c.start=2;BOOST_REQUIRE(p.setRecordingControl(1,c));
     AudioBuffer<float> audio(2,10);MidiBuffer midi;
     auto run=[&]{audio.clear();p.processBlock(audio,midi);midi.clear();clock.ppq+=.1;return p.view();};
-    p.request(A::overdub);auto v=run();BOOST_REQUIRE(v.armed);BOOST_CHECK_EQUAL(v.countIn,3);
+    p.request(A::overdub);auto v=run();BOOST_REQUIRE(v.armed);BOOST_CHECK_EQUAL(v.countIn,4);
     BOOST_CHECK(!p.setRecordingControl(1,c));BOOST_CHECK(!p.setMidiMapping(6,{71,1}));
     p.request(A::record);v=run();BOOST_CHECK(v.armed);BOOST_CHECK_EQUAL(v.count,0);
     p.request(A::overdub);v=run();BOOST_CHECK(!v.armed);BOOST_CHECK_EQUAL(v.count,0);
@@ -134,7 +134,7 @@ BOOST_AUTO_TEST_CASE(EachControllerFinishesAfterItsOwnNumberOfLoopLengths)
     AudioBuffer<float> audio(2,10);MidiBuffer midi;
     auto run=[&]{audio.clear();p.processBlock(audio,midi);midi.clear();return p.view();};
     p.request(A::record);for(int i=0;i<10;++i)run();p.request(A::play);run();
-    for(int i=0;i<2;++i){auto c=p.recordingControl(i);c.shortAction=0;c.loops=i+1;c.overwrite=true;BOOST_REQUIRE(p.setRecordingControl(i,c));}
+    for(int i=0;i<2;++i){auto c=p.recordingControl(i);c.shortAction=0;c.finishFixed=false;c.loops=i+1;c.overwrite=true;BOOST_REQUIRE(p.setRecordingControl(i,c));}
     for(int control=0;control<2;++control){p.request(control==0?A::record:A::overdub);
         for(int i=0;i<(control+1)*10-1;++i)BOOST_CHECK_EQUAL(run().state,int(LooperEngine::State::overdubbing));
         BOOST_CHECK_EQUAL(run().state,int(LooperEngine::State::playing));}
@@ -400,7 +400,7 @@ BOOST_AUTO_TEST_CASE(DisplayTracksActualCountInAndKeepsRecordingUntilCaptureEnds
     auto c=p.recordingControl(1);c.start=2;c.bars=2;c.metronome=false;BOOST_REQUIRE(p.setRecordingControl(1,c));
     AudioBuffer<float> audio(2,10);MidiBuffer midi;
     auto run=[&]{audio.clear();p.processBlock(audio,midi);midi.clear();clock.ppq+=.1;return looperDisplayStatus(p.view(),true,false,false,-40);};
-    p.request(A::overdub);auto display=run();BOOST_CHECK_EQUAL(display.main,"2");BOOST_CHECK(display.countdown);
+    p.request(A::overdub);auto display=run();BOOST_CHECK_EQUAL(display.main,"3");BOOST_CHECK(display.countdown);
     for(int i=1;i<20;++i)display=run();BOOST_CHECK_EQUAL(display.main,"1");
     for(int i=20;i<32;++i)display=run();BOOST_CHECK_EQUAL(display.main,"Recording");BOOST_CHECK(!display.countdown);
     for(int i=0;i<5;++i)BOOST_CHECK_EQUAL(run().main,"Recording");
@@ -454,4 +454,85 @@ BOOST_AUTO_TEST_CASE(ManagerDisplaySummarizesGroupAndPrioritizesActions)
     members[0].online=false;members[1].online=false;
     d=display(true,"Percussion",2);BOOST_CHECK_EQUAL(d.main,"Audio offline");BOOST_CHECK(!d.countdown);
 }
+BOOST_AUTO_TEST_CASE(OverlappingRecordingPedalReleaseCannotFinishFreshRecord)
+{
+    for(bool releaseOwnerFirst:{false,true}) {
+        LooperProcessor p;p.prepareToPlay(1000,1);p.setCrossfade(0);p.setCaptureTail(0);
+        AudioBuffer<float> audio(2,1);MidiBuffer midi;
+        auto run=[&](int frames){for(int n=0;n<frames;++n){audio.clear();p.processBlock(audio,midi);midi.clear();p.view();}return p.view();};
+        auto edge=[&](int cc,int value){midi.addEvent(MidiMessage::controllerEvent(1,cc,value),0);return run(1);};
+        p.request(A::record);run(2000);p.request(A::play);run(1);
+        edge(20,127);run(805); // Record hold starts a fresh capture.
+        BOOST_REQUIRE_EQUAL(p.view().state,int(LooperEngine::State::recording));
+        edge(23,127);run(10);
+        if(releaseOwnerFirst){edge(20,0);edge(23,0);}else{edge(23,0);edge(20,0);}
+        auto v=run(30);BOOST_CHECK_EQUAL(v.state,int(LooperEngine::State::recording));BOOST_CHECK_EQUAL(v.count,1);
+        // A genuinely new gesture may finish recording.
+        edge(23,127);v=edge(23,0);BOOST_CHECK_EQUAL(v.state,int(LooperEngine::State::playing));
+    }
+}
+BOOST_AUTO_TEST_CASE(LinkedInitialCaptureUsesLayerPolicyAtMasterBoundary)
+{
+    for(bool sound:{false,true})for(bool overwrite:{false,true})for(bool finish:{false,true}) {
+        LooperEngine e;e.prepare(1000);e.setTransitionOptions(0,0);e.setOptions(false,100,0);
+        e.setCaptureBehavior(overwrite,false,finish?1:0);e.setLinkContext(2,1000,500,0);
+        e.setPerformanceOptions(true,false,false,false,sound,2,.05f);e.applyPerformance(A::overdub);
+        for(int i=0;i<500;++i)tick(e,.2f);
+        BOOST_CHECK_EQUAL(e.getLength(),1000);BOOST_CHECK_EQUAL(e.getLayerCount(),1);
+        BOOST_CHECK(e.getState()==(finish?LooperEngine::State::playing:LooperEngine::State::overdubbing));
+        tick(e,.3f);BOOST_CHECK_EQUAL(e.getLayerCount(),finish||overwrite?1:2);
+        if(!finish&&!overwrite){BOOST_CHECK_EQUAL(e.getLayer(0).take,e.getLayer(1).take);BOOST_CHECK_EQUAL(e.layerSample(0,0,100),0);e.apply(A::undo);BOOST_CHECK_EQUAL(e.getLayerCount(),0);}
+    }
+}
+BOOST_AUTO_TEST_CASE(CountInIncludesPartialLeadingBarAndBeat)
+{
+    LooperEngine e;e.prepare(1000);e.setOptions(true,100,0);e.setClock(60,4,4,2,true);
+    e.setPerformanceOptions(true,false,false,false,true,2,.1f);e.applyPerformance(A::overdub);
+    BOOST_CHECK_EQUAL(e.getCountInRemaining(),3);BOOST_CHECK_EQUAL(e.getBarPhase(),2000);
+    for(int i=0;i<2000;++i)tick(e);BOOST_CHECK_EQUAL(e.getCountInRemaining(),2);BOOST_CHECK_EQUAL(e.getBarPhase(),0);
+    LooperProcessor::View v;v.armed=true;v.countIn=3;v.barPhase=2000;v.barFrames=4000;v.numerator=4;
+    auto d=looperDisplayStatus(v,true,false,false,-40);BOOST_CHECK_EQUAL(d.main,"3");BOOST_CHECK_EQUAL(d.detail,"Beat 3 / 4");
+}
+
+BOOST_AUTO_TEST_CASE(FirstRecordingGestureOwnsAllFourProfilesUntilRelease)
+{
+    for(int owner=0;owner<4;++owner)for(int intruder=0;intruder<4;++intruder)if(owner!=intruder)
+    for(bool ownerReleasedFirst:{false,true}) {
+        LooperProcessor p;p.prepareToPlay(1000,100);
+        const int cc[]{20,23,70,71};
+        for(int i=0;i<4;++i){auto c=p.recordingControl(i);c.enabled=true;c.start=0;c.holdAction=4;c.stopAfter=false;BOOST_REQUIRE(p.setRecordingControl(i,c));}
+        BOOST_REQUIRE(p.setMidiMapping(6,{70,1}));BOOST_REQUIRE(p.setMidiMapping(7,{71,1}));
+        AudioBuffer<float> audio(2,100);MidiBuffer midi;
+        auto run=[&](int n=1){for(int i=0;i<n;++i){audio.clear();p.processBlock(audio,midi);midi.clear();p.view();}return p.view();};
+        auto edge=[&](int i,int value){midi.addEvent(MidiMessage::controllerEvent(1,cc[i],value),0);return run();};
+        edge(owner,127);edge(intruder,127);run(10);
+        BOOST_REQUIRE_EQUAL(p.view().state,int(LooperEngine::State::recording));BOOST_CHECK_EQUAL(p.view().controller,owner);
+        if(ownerReleasedFirst){edge(owner,0);run();edge(intruder,0);}else{edge(intruder,0);BOOST_CHECK_EQUAL(p.view().state,int(LooperEngine::State::recording));edge(owner,0);}
+        BOOST_CHECK_EQUAL(p.view().state,int(LooperEngine::State::playing));BOOST_CHECK_EQUAL(p.view().count,1);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(RC2DurationPoliciesUseOwnCycleAndCaptureDuration)
+{
+    for(int policy=0;policy<4;++policy)for(int offset:{0,40}) {
+        LooperEngine e;base(e);for(int n=0;n<offset;++n)tick(e);
+        e.setOptions(false,0,policy>=2?1:0);e.setCaptureBehavior(false,false,policy==1?1:0);e.setFinishAtBoundary(policy==3);
+        e.apply(A::overdub);
+        const int expected=policy==1?100-offset:policy==3&&offset>0?200-offset:100;
+        for(int n=0;n<expected-1;++n)tick(e,.2f);
+        BOOST_REQUIRE(e.getState()==LooperEngine::State::overdubbing);tick(e,.2f);
+        BOOST_CHECK(e.getState()==(policy==0?LooperEngine::State::overdubbing:LooperEngine::State::playing));
+    }
+}
+BOOST_AUTO_TEST_CASE(RC2ZeroExtraBarsMeansNextBoundaryAndRoundPolicyPersists)
+{
+    LooperEngine e;e.prepare(1000);e.setOptions(true,0,0);e.setClock(60,4,4,2,true);
+    e.setPerformanceOptions(true,false,false,true,true,0,.1f);e.applyPerformance(A::overdub);
+    BOOST_CHECK_EQUAL(e.getCountInRemaining(),1);for(int n=0;n<2000;++n)tick(e);tick(e);
+    BOOST_CHECK(e.getState()==LooperEngine::State::recording);
+    LooperProcessor p;auto c=p.recordingControl(1);c.start=2;c.bars=0;c.loops=3;c.finishAtBoundary=true;BOOST_REQUIRE(p.setRecordingControl(1,c));
+    MemoryBlock data;p.getStateInformation(data);LooperProcessor restored;restored.setStateInformation(data.getData(),int(data.getSize()));
+    auto saved=restored.recordingControl(1);BOOST_CHECK_EQUAL(saved.bars,0);BOOST_CHECK_EQUAL(saved.loops,3);BOOST_CHECK(saved.finishAtBoundary);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

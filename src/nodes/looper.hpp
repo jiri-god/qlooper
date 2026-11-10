@@ -24,7 +24,7 @@ public:
         int shortAction=0, holdAction=2, start=1, bars=2;
         bool finishFixed=false, overwrite=false, hearPrevious=false, enabled=true;
         int loops=0;
-        bool metronome=false, feedbackWithinTake=true, stopAfter=false;
+        bool metronome=false, feedbackWithinTake=true, stopAfter=false, finishAtBoundary=false;
     };
     RecordingControl recordingControl(int index) const noexcept;
     bool setRecordingControl(int index, RecordingControl);
@@ -37,7 +37,7 @@ public:
         int capacity=0, importLength=0, linkMode=0, linkBase=0, requestedBars=0, masterLength=0, masterPosition=0;
         int state = 0, length = 0, position = 0, count = 0, recordings = 0, barFrames=0, captureTarget=0, capturedProgress=0;
         int displaySyncPosition=0,displayMasterPosition=0;
-        int waitingAction=0,countIn=0,syncPosition=0; bool soundWaiting=false;
+        int waitingAction=0,countIn=0,syncPosition=0,barPhase=0; bool soundWaiting=false;
         bool momentaryMuted=false;
         bool fixedCompatible=true,overwrite=false,transportWaiting=false;
         double rate = 44100, bpm = 0;
@@ -230,6 +230,7 @@ private:
     void applySectionEvent(bool start) noexcept;
     struct PedalGesture { bool down=false, fired=false; int64_t elapsed=0; };
     std::array<PedalGesture,6> gestures {};
+    std::array<bool,6> suppressedRecordingPress {};
     std::array<std::atomic<uint32_t>,4> recordingControls;
     int currentController=-1;
     RecordingControl activeControl;

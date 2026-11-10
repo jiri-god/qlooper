@@ -1,4 +1,4 @@
-# Build QLooper RC1 on macOS
+# Build QLooper RC2 on macOS
 
 Apple Command Line Tools/Xcode, CMake 3.26+ and Boost 1.74+ are required.
 The release uses Apple Silicon (`arm64`), macOS deployment target 14.0 and
@@ -18,7 +18,7 @@ open build/element_app_artefacts/RelWithDebInfo/QLooper.app
 ```
 
 Configure downloads the pinned JUCE/sol2 sources. With the accompanying
-`QLooper-1.0.0-rc1-dependency-sources.tar.gz`, unpack it beside this checkout and add:
+`QLooper-1.0.0-rc2-dependency-sources.tar.gz`, unpack it beside this checkout and add:
 
 ```sh
 -DFETCHCONTENT_SOURCE_DIR_JUCE=/absolute/path/dependencies/JUCE \

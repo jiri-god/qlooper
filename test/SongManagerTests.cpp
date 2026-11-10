@@ -114,7 +114,7 @@ BOOST_AUTO_TEST_CASE(LiveOverviewWithRecordedSectionCanRender) {
     TextButton* helpToggle=nullptr;ComboBox* timing=nullptr;
     for(auto* c:editor.getChildren()){
         if(auto* b=dynamic_cast<TextButton*>(c);b && b->getButtonText()=="?")helpToggle=b;
-        if(auto* box=dynamic_cast<ComboBox*>(c);box && box->getNumItems()==3)timing=box;
+        if(auto* box=dynamic_cast<ComboBox*>(c);box && box->getNumItems()==2 && box->getItemText(0)=="Now")timing=box;
     }
     BOOST_REQUIRE(helpToggle);BOOST_REQUIRE(timing);
     BOOST_CHECK(timing->getTooltip().isNotEmpty());

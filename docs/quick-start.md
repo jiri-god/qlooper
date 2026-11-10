@@ -1,4 +1,4 @@
-# QLooper RC1 — your first loop
+# QLooper RC2 — your first loop
 
 QLooper includes a modified Element host. You do **not** need a separate Element
 installation. Some menus and internal nodes still use the Element name.
@@ -7,9 +7,9 @@ installation. Some menus and internal nodes still use the Element name.
 
 1. Open the DMG and drag **QLooper.app** to **Applications**. Eject the DMG and
    open the copied app. Use this build: stock Element does not contain our nodes.
-   Choose the Apple Silicon build. macOS 14 is the build minimum; RC1 has been
+   Choose the Apple Silicon build. macOS 14 is the build minimum; RC2 has been
    tested locally on macOS 26, not on every older macOS release.
-2. This initial RC1 is not notarized. If macOS blocks it, follow Apple's
+2. This initial RC2 is not notarized. If macOS blocks it, follow Apple's
    [Open Anyway procedure](https://support.apple.com/en-us/102445) in
    **System Settings → Privacy & Security**, after verifying the download source.
    Do not disable Gatekeeper globally.
@@ -99,5 +99,14 @@ path if you do not want it recorded in the loop.
 - Check Monitor, Mute, Bypass, mixer level and Song Manager's active section/Panic.
 - Rig transport and loop playback are separate controls; transport Play alone
   does not necessarily play a stopped loop.
-- For a useful bug report: include RC1 version, macOS, device, sample rate/buffer,
+- For a useful bug report: include RC2 version, macOS, device, sample rate/buffer,
   exact actions and whether the fault is audible in a Recorder capture.
+
+
+## Recording timing in RC2
+
+- In Settings > Recording, choose Now or Count-in for Sync/Fixed. **1 = Next bar**, 2 = one full bar later. Free uses Wait for sound instead.
+- Recording length: Until stopped, To loop end, or N Loop lengths. With N lengths, Finish at loop boundary optionally extends to the next cycle end.
+- Stop after recording controls playback afterwards, independently of recording length.
+- Managers use the same Count-in numbering for switching; the target recording profile may add its own wait.
+- RC1 Finish recording is now To loop end. Save an RC2 session copy: older builds cannot read the new settings. See [RC2 notes](rc2-notes.md).

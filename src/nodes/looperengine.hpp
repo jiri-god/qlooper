@@ -158,7 +158,7 @@ public:
     SnapshotView snapshotView() noexcept
     {
         SnapshotView result;
-        result.rate = rate; result.length = initialFixedTarget>0?initialFixedTarget:length; result.capacity = capacity; result.count = count;
+        result.rate = rate; result.length = initialFixedTarget>0 && !linkedCapture?initialFixedTarget:length; result.capacity = capacity; result.count = count;
         result.fixedLength = fixedLength; result.multiple = multiple; result.phaseOffset = phaseOffset;
         for (int i = 0; i < count; ++i) {
             auto& slot = slots[active[i]];
@@ -525,7 +525,7 @@ public:
     void setOverdubNextBar(bool value) noexcept { overdubNextBar=value; }
     void setFixedBars(int bars) noexcept { requestedBars=std::clamp(bars,0,256); }
     int getBarFrames() const noexcept { return clockBar; }
-    int getCaptureTarget() const noexcept { return initialFixedTarget; }
+    int getCaptureTarget() const noexcept { return linkedCapture && initialFixedTarget>0?length:initialFixedTarget; }
     int getCapturedProgress() const noexcept { return linkedCapture?int(capturedFrames):length; }
     bool fixedBarsCompatible() const noexcept {
         if(requestedBars==0 || length>0)return true;
@@ -611,20 +611,22 @@ public:
     // Latched by the processor before capture; never changed during a take.
     void setCaptureBehavior(bool overwrite, bool hearPrevious, int finishFixed=-1) noexcept
     { overwritePass=overwrite; hearPreviousPass=hearPrevious; fixedFinish=finishFixed; }
-    void setControllerCountIn(int bars) noexcept { countInBars=std::clamp(bars,1,8); }
+    void setFinishAtBoundary(bool value) noexcept { finishAtBoundary=value; }
+    void setControllerCountIn(int bars) noexcept { countInBars=std::clamp(bars,0,8); }
     bool capturingNow() const noexcept { return state==State::recording || state==State::overdubbing || state==State::replacing; }
     void setPerformanceOptions(bool preserve, bool playBar, bool stopBar,
                                bool recPrepare, bool odPrepare, int bars, float threshold) noexcept
     {
         preserveTimeline=preserve; playOnBar=playBar; stopOnBar=stopBar;
         prepareRecord=recPrepare; prepareOverdub=odPrepare;
-        countInBars=std::clamp(bars,1,8); triggerLevel=std::clamp(threshold,0.00001f,1.0f);
+        countInBars=std::clamp(bars,0,8); triggerLevel=std::clamp(threshold,0.00001f,1.0f);
     }
     int getWaitingAction() const noexcept { return performancePending ? int(performanceAction)+1 : 0; }
     int getCountInRemaining() const noexcept {
         return performancePending && quantized && clockBar>0
-            ? std::min(countInBars,int((waitFrames+clockBar-1)/clockBar)) : 0;
+            ? int((waitFrames+clockBar-1)/clockBar) : 0;
     }
+    int getBarPhase() const noexcept { return clockPhase; }
     bool countInAudible() const noexcept { return performancePending && quantized && !waitForSound && (performanceAction==Action::record || performanceAction==Action::overdub || performanceAction==Action::freshRecord) && waitFrames>0 && waitFrames<=int64_t(countInBars)*clockBar; }
     bool waitingForSound() const noexcept { return performancePending && waitForSound; }
     int getSyncPosition() const noexcept {
@@ -969,6 +971,10 @@ public:
                         if (growingCapture) slot.written=length;
                         else { slot.written=std::min(length,slot.written+1);captureCursor=modulo(captureCursor+1,length); }
                     }
+                    // Attack recovery may begin in the previous cycle. Do not
+                    // end the first pass at a boundary already crossed by history.
+                    if(initialFixedTarget>0 && linkedPreRoll>=initialFixedTarget)
+                        initialFixedTarget+=length;
                     capturedFrames=linkedPreRoll;
                     preSourceStart=modulo(recentWrite-linkedPreRoll-slot.preFrames,int(recent[0].size()));
                     preSourceMissing=std::max(0,slot.preFrames-std::max(0,recentCount-linkedPreRoll));
@@ -1166,8 +1172,8 @@ public:
             int parts=0;
             if(!overwritePass && !rolling && position+1==length)
                 for(int i=0;i<count;++i)parts+=slots[active[i]].info.take==layer.info.take;
-            if ((requestedBars>0 && (fixedFinish<0?recordLayer:fixedFinish!=0) && overdubFrames>=length)
-                || (passes > 0 && overdubFrames >= static_cast<int64_t> (length) * passes)
+            if (((fixedFinish>0 && position+1==length) || (fixedFinish<0 && requestedBars>0 && recordLayer && overdubFrames>=length))
+                || (passes > 0 && overdubFrames >= static_cast<int64_t> (length) * passes && (!finishAtBoundary || position+1==length))
                 || (!overwritePass && !rolling && parts>=takeLimit))
                 finishLayerCapture((position + 1) % length);
         }
@@ -1265,7 +1271,7 @@ public:
     {
         Snapshot result;
         result.rate = rate;
-        result.length = initialFixedTarget>0?initialFixedTarget:length;
+        result.length = initialFixedTarget>0 && !linkedCapture?initialFixedTarget:length;
         result.fixedLength = fixedLength; result.multiple = multiple; result.phaseOffset = phaseOffset;
         for (int i = 0; i < count; ++i)
         {
@@ -1512,7 +1518,7 @@ private:
     }
     int recordingLimitCount=10,takeLimit=4,durationSeconds=60;
     bool rolling=true;
-    bool overwritePass=false,hearPreviousPass=false;
+    bool overwritePass=false,hearPreviousPass=false,finishAtBoundary=false;
     int fixedFinish=-1;
     int rollingSlot=-1,rollingRemaining=0;
     uint32_t nextTake=1;
@@ -1659,19 +1665,19 @@ private:
         recordingBar = base; recordingLimit = capacity / base * base;
         armed = false; pendingEnd = 0; linkedEndFrame = -1; pendingStop = false;
         linkedCapture = true; capturedFrames = 0; state = State::recording;
-        initialFixedTarget=requestedBars>0?length:0;
-        if(initialFixedTarget>0 && viaOverdub)slots[slot].info.take=nextTake++;
+        initialFixedTarget=growingCapture?0:length-captureCursor;
+        if(initialFixedTarget>0)slots[slot].info.take=nextTake++;
 
     }
     void endLinkedRecording (bool stop) noexcept
     {
-        if(initialFixedTarget>0) { finishLinkedRecording(stop);return; }
         if (linkedEndFrame >= 0) return;
         if (capturedFrames == 0) {
             active=undoActive; count=undoCount; length=undoLength; position=previousPosition; runFrames=previousRunFrames;
             state=previousState==State::overdubbing?State::playing:previousState;
-            linkedCapture=false; undoKind=UndoKind::none; undoCount=0; undoSize=undoCursor=std::max(0,undoCursor-1); return;
+            linkedCapture=false; initialFixedTarget=0; undoKind=UndoKind::none; undoCount=0; undoSize=undoCursor=std::max(0,undoCursor-1); return;
         }
+        if(initialFixedTarget>0) { finishLinkedRecording(stop);return; }
         pendingStop = stop;
         if (growingCapture) {
             const int previous = length / recordingBar * recordingBar;
@@ -1708,8 +1714,8 @@ private:
         position = modulo((nextFrame>=0?nextFrame:linkFrame) - captureOrigin,length);
         beginPostCapture(active[0], position);
         state = length > 0 ? (stop ? State::stopped : State::playing) : State::empty;
-        if(keepOverdubbing && !((!rolling && takeLimit==1) || passes==1)) {
-            state=State::overdubbing;recordLayer=false;overdubFrames=length;
+        if(keepOverdubbing && !((!overwritePass && !rolling && takeLimit==1) || (passes>0 && capturedFrames>=uint64_t(length)*passes))) {
+            state=State::overdubbing;recordLayer=false;overdubFrames=int64_t(capturedFrames);
             feedbackStep=feedbackLevel>0?std::pow(double(feedbackLevel),1.0/length):1;
         }
         rebuildTakeLinks();declick = true;

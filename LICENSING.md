@@ -1,6 +1,6 @@
 # Licensing and future commercial editions
 
-## RC1 source and executable
+## RC2 source and executable
 
 - Preserve each file's existing copyright and SPDX notice. Element and our
   integrated modifications use **GPL-3.0-or-later** unless marked otherwise.
@@ -37,7 +37,7 @@ The intended legal entity for future contributor agreements and publishing is
 **4lt s.r.o.** Contributor terms are still being prepared; this statement does
 not transfer copyright or change any upstream licence.
 
-For RC1, please submit bug reports and reproduction steps. Code contributions
+For RC2, please submit bug reports and reproduction steps. Code contributions
 are not being accepted until contributor terms have been agreed. We will not
 silently incorporate outside code into a future closed-source edition. Authors
 retain their rights; any additional licensing permission must be explicit.

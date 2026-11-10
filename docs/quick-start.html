@@ -1,13 +1,13 @@
-<!doctype html><html lang="en"><meta charset="utf-8"><title>QLooper RC1 - Quick start</title><style>body{font:17px/1.55 system-ui,sans-serif;color:#202a35;max-width:850px;margin:40px auto;padding:0 24px}h1,h2{line-height:1.2}h1{color:#17657d}h2{margin-top:32px}li{margin:8px 0}a{color:#17657d}@media print{body{font-size:11pt;margin:0}h2{break-after:avoid}li{break-inside:avoid}}</style><body><h1>QLooper RC1 — your first loop</h1>
+<!doctype html><html lang="en"><meta charset="utf-8"><title>QLooper RC2 - Quick start</title><style>body{font:17px/1.55 system-ui,sans-serif;color:#202a35;max-width:850px;margin:40px auto;padding:0 24px}h1,h2{line-height:1.2}h1{color:#17657d}h2{margin-top:32px}li{margin:8px 0}a{color:#17657d}@media print{body{font-size:11pt;margin:0}h2{break-after:avoid}li{break-inside:avoid}}</style><body><h1>QLooper RC2 — your first loop</h1>
 <p>QLooper includes a modified Element host. You do <strong>not</strong> need a separate Element
 installation. Some menus and internal nodes still use the Element name.</p>
 <h2>1. Install and select your audio device</h2>
 <ol>
 <li>Open the DMG and drag <strong>QLooper.app</strong> to <strong>Applications</strong>. Eject the DMG and
    open the copied app. Use this build: stock Element does not contain our nodes.
-   Choose the Apple Silicon build. macOS 14 is the build minimum; RC1 has been
+   Choose the Apple Silicon build. macOS 14 is the build minimum; RC2 has been
    tested locally on macOS 26, not on every older macOS release.</li>
-<li>This initial RC1 is not notarized. If macOS blocks it, follow Apple's
+<li>This initial RC2 is not notarized. If macOS blocks it, follow Apple's
    <a href="https://support.apple.com/en-us/102445">Open Anyway procedure</a> in
    <strong>System Settings → Privacy &amp; Security</strong>, after verifying the download source.
    Do not disable Gatekeeper globally.</li>
@@ -93,6 +93,14 @@ path if you do not want it recorded in the loop.</p>
 <li>Check Monitor, Mute, Bypass, mixer level and Song Manager's active section/Panic.</li>
 <li>Rig transport and loop playback are separate controls; transport Play alone
   does not necessarily play a stopped loop.</li>
-<li>For a useful bug report: include RC1 version, macOS, device, sample rate/buffer,
+<li>For a useful bug report: include RC2 version, macOS, device, sample rate/buffer,
   exact actions and whether the fault is audible in a Recorder capture.</li>
+</ul>
+<h2>Recording timing in RC2</h2>
+<ul>
+<li>In Settings &gt; Recording, choose Now or Count-in for Sync/Fixed. <strong>1 = Next bar</strong>, 2 = one full bar later. Free uses Wait for sound instead.</li>
+<li>Recording length: Until stopped, To loop end, or N Loop lengths. With N lengths, Finish at loop boundary optionally extends to the next cycle end.</li>
+<li>Stop after recording controls playback afterwards, independently of recording length.</li>
+<li>Managers use the same Count-in numbering for switching; the target recording profile may add its own wait.</li>
+<li>RC1 Finish recording is now To loop end. Save an RC2 session copy: older builds cannot read the new settings. See <a href="rc2-notes.md">RC2 notes</a>.</li>
 </ul></body></html>

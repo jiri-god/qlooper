@@ -1,0 +1,16 @@
+QLooper — intended Nektar Pacer configuration
+
+Verified by device readback on 2026-11-10. A1 export includes preset LEDs.
+Global Config is not included. QLooper actions remain configurable.
+
+A1 — Looper controls; MIDI channel 1; CC Trigger 127 on press, 0 on release.
+Switch 1: CC23 — Overdub / configured hold action
+Switch 2: CC20 — Record / configured hold action
+Switch 3: CC21 — Play/Stop / configured hold action
+Switch 4: CC29 — Undo / Redo
+Switch 5: CC28 — Play All
+Switch 6: CC27 — Stop All / configured hold action
+Switch B: CC30 — Song section / Panic or Restore
+Switch C: CC24 — Previous looper / configured short and long actions
+Switch D: CC25 — Next looper / configured short and long actions
+

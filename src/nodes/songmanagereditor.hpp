@@ -32,7 +32,7 @@ private:
     bool showingSettings=false;
     SongManagerNode* manager;
     juce::TextButton settings {"Settings"};
-    juce::Label title,status,help,switchLabel,barsLabel,recordLabel,channelLabel;
+    juce::Label title,status,help,switchLabel,barsLabel, countHint,recordLabel,channelLabel;
     juce::ComboBox sections,timing,recording;
     juce::Slider bars,channel;
     juce::ListBox list;

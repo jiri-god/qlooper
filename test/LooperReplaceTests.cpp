@@ -699,10 +699,10 @@ BOOST_AUTO_TEST_CASE(FixedBarsLinkedCaptureKeepsMasterPhaseAndContinuesAtThatPha
     for(int i=0;i<50;++i)process(e,0);
     for(int i=0;i<400;++i)process(e,float(i+1));
     BOOST_CHECK_EQUAL(e.getLength(),400);BOOST_CHECK_EQUAL(e.getFixedLength(),400);
-    BOOST_CHECK_EQUAL(e.layerSample(0,0,100),1);BOOST_CHECK_EQUAL(e.layerSample(0,0,99),400);
+    BOOST_CHECK_EQUAL(e.layerSample(0,0,100),1);BOOST_CHECK_EQUAL(e.layerSample(0,0,99),0);BOOST_CHECK_EQUAL(e.layerSample(1,0,99),400);
     BOOST_CHECK_EQUAL(e.getPosition(),100);BOOST_CHECK(e.getState()==LooperEngine::State::overdubbing);
     process(e,5);BOOST_REQUIRE_EQUAL(e.getLayerCount(),2);
-    BOOST_CHECK_EQUAL(e.snapshot().layers[1].coverageStart,100);
+    BOOST_CHECK_EQUAL(e.snapshot().layers[1].coverageStart,0);
 }
 BOOST_AUTO_TEST_CASE(EmptySyncOverdubImmediateRecoversCurrentBarAndClockStopCancelsWait)
 {

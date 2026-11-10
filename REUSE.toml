@@ -49,3 +49,14 @@ path = [ "README.md", "LICENSING.md", "CONTRIBUTING.md", "THIRD-PARTY-NOTICES.md
 precedence = "override"
 SPDX-FileCopyrightText = "2026 QLooper contributors"
 SPDX-License-Identifier = "CC0-1.0"
+
+[[annotations]]
+path = [ "docs/rc2-notes.md", "extras/nektar-pacer/*.txt", "VERSION" ]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 QLooper contributors"
+SPDX-License-Identifier = "CC0-1.0"
+
+[[annotations]]
+path = "extras/nektar-pacer/*.syx"
+SPDX-FileCopyrightText = "2026 QLooper contributors"
+SPDX-License-Identifier = "GPL-3.0-or-later"

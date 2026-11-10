@@ -1466,10 +1466,12 @@ BOOST_AUTO_TEST_CASE(MasterLinkedSameCircularAndMultiplesSilentPrefix)
     LooperEngine master;master.prepare(100); master.setTransitionOptions(0,0);master.setLinkContext(1,0,0,0);
     master.apply(Action::record);for(int i=0;i<4;++i)frame(master,.1f,.2f);master.apply(Action::record);
     BOOST_REQUIRE_EQUAL(master.getFixedLength(),4);BOOST_CHECK_EQUAL(master.getOrigin(),0);
-    LooperEngine same;same.prepare(100); same.setTransitionOptions(0,0);same.setLinkContext(2,4,2,0);same.apply(Action::record);
-    for(int i=1;i<=4;++i)frame(same,float(i),float(i));same.apply(Action::record);
+    LooperEngine same;same.prepare(100); same.setTransitionOptions(0,0);same.setLinkContext(2,4,2,0);same.setCaptureBehavior(false,false,0);same.apply(Action::record);
+    for(int i=1;i<=4;++i)frame(same,float(i),float(i));same.apply(Action::play);
     BOOST_CHECK_EQUAL(same.getFixedLength(),4);
-    BOOST_CHECK_EQUAL(same.layerSample(0,0,0),3);BOOST_CHECK_EQUAL(same.layerSample(0,0,1),4);
+    BOOST_REQUIRE_EQUAL(same.getLayerCount(),2);
+    BOOST_CHECK_EQUAL(same.layerSample(0,0,0),0);BOOST_CHECK_EQUAL(same.layerSample(0,0,1),0);
+    BOOST_CHECK_EQUAL(same.layerSample(1,0,0),3);BOOST_CHECK_EQUAL(same.layerSample(1,0,1),4);
     BOOST_CHECK_EQUAL(same.layerSample(0,0,2),1);BOOST_CHECK_EQUAL(same.layerSample(0,0,3),2);
     same.apply(Action::record);frame(same,7,7);same.apply(Action::record);
     BOOST_CHECK_EQUAL(same.getLength(),4);BOOST_CHECK_EQUAL(same.getFixedLength(),4);

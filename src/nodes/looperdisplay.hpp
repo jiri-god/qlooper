@@ -29,7 +29,7 @@ inline LooperDisplayStatus looperDisplayStatus(const LooperProcessor::View& v,
         else if(v.soundWaiting){d.main="Waiting for sound";d.detail=juce::String(threshold,0)+" dB";}
         else if(v.waitingAction==int(LooperEngine::Action::play)+1){d.main="Play in "+juce::String(juce::jmax(1,v.countIn));d.detail="Next bar";}
         else if(v.waitingAction==int(LooperEngine::Action::stop)+1){d.main="Stop in "+juce::String(juce::jmax(1,v.countIn));d.detail="Next bar";}
-        else {d.main=juce::String(juce::jmax(1,v.countIn));d.detail="Bars to recording";d.countdown=true;}
+        else {d.main=juce::String(juce::jmax(1,v.countIn));d.detail="Beat "+juce::String(v.barFrames>0?juce::jlimit(1,juce::jmax(1,v.numerator),1+int(int64_t(v.barPhase)*juce::jmax(1,v.numerator)/v.barFrames)):1)+" / "+juce::String(juce::jmax(1,v.numerator));d.countdown=true;}
     } else {
         d.main=v.state==2?"Playing":v.count>0?"Stopped":"Empty";
         if(v.linkMode>1 && v.linkBase<=0)d.detail="Waiting for master";

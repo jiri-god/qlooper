@@ -516,7 +516,7 @@ BOOST_AUTO_TEST_CASE(StatusDisplayShowsLargeCountThenPersistentRecording)
     AudioBuffer<float> audio(2,10);MidiBuffer midi;
     auto run=[&]{audio.clear();p.processBlock(audio,midi);p.view();midi.clear();clock.ppq+=.1;};
     p.request(LooperEngine::Action::overdub);run();MessageManager::getInstance()->runDispatchLoopUntil(100);
-    BOOST_CHECK(display->getText().startsWith("2\n"));
+    BOOST_CHECK(display->getText().startsWith("3\n"));
     auto snapshot=[&](const char* name){if(!std::getenv("EL_LOOPER_EDITOR_SNAPSHOT"))return;File file(name);auto out=file.createOutputStream();BOOST_REQUIRE(out);out->setPosition(0);out->truncate();PNGImageFormat format;BOOST_CHECK(format.writeImageToStream(editor->createComponentSnapshot(editor->getLocalBounds()),*out));};
     snapshot("/tmp/element-looper-display-countdown.png");
     for(int i=0;i<32;++i)run();p.setMuted(true);MessageManager::getInstance()->runDispatchLoopUntil(100);

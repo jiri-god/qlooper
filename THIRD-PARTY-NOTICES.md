@@ -1,4 +1,4 @@
-# Third-party notices — QLooper RC1
+# Third-party notices — QLooper RC2
 
 The release is an independent modification of Kushview Element. Original
 copyrights and licence notices are retained. Sources and complete notices for

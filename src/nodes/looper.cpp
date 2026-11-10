@@ -281,7 +281,7 @@ void LooperProcessor::fillInPluginDescription (PluginDescription& d) const
     d.fileOrIdentifier = EL_NODE_ID_LOOPER;
     d.pluginFormatName = "Element";
     d.manufacturerName = EL_NODE_FORMAT_AUTHOR;
-    d.version = "1.8.0";
+    d.version = "1.9.0";
     d.numInputChannels = d.numOutputChannels = 2;
     d.isInstrument = false;
     d.hasSharedContainer = false;
@@ -397,12 +397,12 @@ uint32_t packControl(LooperProcessor::RecordingControl c) {
         |(uint32_t(c.bars)<<6)|(uint32_t(c.finishFixed)<<10)|(uint32_t(c.overwrite)<<11)
         |(uint32_t(c.hearPrevious)<<12)|(uint32_t(c.enabled)<<13)
         |(uint32_t(c.metronome)<<14)|(uint32_t(c.feedbackWithinTake)<<15)
-        |(uint32_t(c.loops)<<16)|(1u<<23)|(uint32_t(c.stopAfter)<<24)|(uint32_t(c.holdAction==4)<<25); // bit23: independent settings, not legacy defaults
+        |(uint32_t(c.loops)<<16)|(1u<<23)|(uint32_t(c.stopAfter)<<24)|(uint32_t(c.holdAction==4)<<25)|(uint32_t(c.finishAtBoundary)<<26); // bit23: independent settings, not legacy defaults
 }
 LooperProcessor::RecordingControl unpackControl(uint32_t n) {
     return {int(n&3),(n&(1u<<25))?4:int((n>>2)&3),int((n>>4)&3),int((n>>6)&15),
         bool(n&1024),bool(n&2048),bool(n&4096),bool(n&8192),
-        int((n>>16)&127),bool(n&(1u<<14)),bool(n&(1u<<15)),bool(n&(1u<<24))};
+        int((n>>16)&127),bool(n&(1u<<14)),bool(n&(1u<<15)),bool(n&(1u<<24)),bool(n&(1u<<26))};
 }
 }
 LooperProcessor::RecordingControl LooperProcessor::recordingControl(int i) const noexcept {
@@ -418,7 +418,7 @@ LooperProcessor::RecordingControl LooperProcessor::recordingControl(int i) const
 }
 bool LooperProcessor::setRecordingControl(int i,RecordingControl c) {
     if(i<0 || i>=4 || recordingSettingsLocked() || c.shortAction<0 || c.shortAction>1
-        || c.holdAction<0 || c.holdAction>4 || c.start<0 || c.start>2 || c.bars<1 || c.bars>8
+        || c.holdAction<0 || c.holdAction>4 || c.start<0 || c.start>2 || c.bars<0 || c.bars>8
         || c.loops<0 || c.loops>64 || (i<2 && !c.enabled))return false;
     recordingControls[i]=packControl(c);
     if(i==0){recordPreparation=c.start==2;recordNextBar=c.start==1;countInBars=c.bars;}
@@ -432,9 +432,11 @@ void LooperProcessor::configureCapture(int i) noexcept {
     engine.setOptions(quantized.load(),graceMs.load(),c.loops);
     engine.setTakeOptions(takeFades.load(),c.feedbackWithinTake);
     engine.setCaptureBehavior(c.overwrite,c.hearPrevious,c.finishFixed?1:0);
-    engine.setRecordNextBar(c.start==1);engine.setOverdubNextBar(c.start==1);
+    engine.setFinishAtBoundary(c.finishAtBoundary);
+    const bool nextBar=c.start==1 || (quantized.load() && c.start==2 && c.bars==0);
+    engine.setRecordNextBar(nextBar);engine.setOverdubNextBar(nextBar);
     engine.setPerformanceOptions(preserveTimeline.load(),playOnBar.load(),stopOnBar.load(),
-        c.start==2,c.start==2,c.bars,Decibels::decibelsToGain(triggerDb.load()));
+        c.start==2&&!nextBar,c.start==2&&!nextBar,c.bars,Decibels::decibelsToGain(triggerDb.load()));
 }
 bool LooperProcessor::claimManagerCapture() noexcept {
     if(managerOwner.load()==0 || !managerCaptureGate)return true;
@@ -530,7 +532,7 @@ void LooperProcessor::publish() noexcept
     data.masterLength=engine.masterLength();data.masterPosition=engine.masterPosition();
     data.length = engine.getLength();
     data.position = engine.getPosition();
-    data.waitingAction=engine.getWaitingAction();data.countIn=engine.getCountInRemaining();
+    data.waitingAction=engine.getWaitingAction();data.countIn=engine.getCountInRemaining();data.barPhase=engine.getBarPhase();
     data.soundWaiting=engine.waitingForSound();data.syncPosition=engine.getSyncPosition();
     // Presentation only: the shared sample clock keeps advancing for synchronization.
     // Assigning a master must not make an idle rig appear to start playing.
@@ -585,6 +587,7 @@ void LooperProcessor::cancelGestures() noexcept
     if (engine.getState()==LooperEngine::State::replacing) engine.apply(LooperEngine::Action::endReplace);
     if(heldRecordActive)engine.endHeldRecord();
     heldRecordActive=false;transportWaitController=-1;transportStartRequested=false;
+    for(int g : {0,3,4,5}) if(gestures[g].down) suppressedRecordingPress[g]=true;
     gestures = {}; held = {}; pedalClearPending = false;
 }
 void LooperProcessor::fireHold(int index) noexcept
@@ -603,6 +606,15 @@ void LooperProcessor::pedalEdge(int action,bool pressed) noexcept
     if(action==3 || action==4){if(pressed)applyAction(midiActionCommands[action]);return;}
     const int index=action==2?0:action==5?1:action==1?3:action>=6?action-2:2;
     auto& gesture=gestures[index];
+    const bool recordingPedal=index==0 || index>=3;
+    if(recordingPedal) {
+        if(suppressedRecordingPress[index]) {if(!pressed)suppressedRecordingPress[index]=false;return;}
+        if(pressed && !gesture.down) {
+            for(int g : {0,3,4,5}) if(g!=index && gestures[g].down) {
+                suppressedRecordingPress[index]=true;return;
+            }
+        }
+    }
     if(pressed) {if(!gesture.down)gesture={true,false,0};}
     else if(gesture.down) {
         if(!gesture.fired && gesture.elapsed>=std::max<int64_t>(1,std::llround(preparedRate*.8))){gesture.fired=true;fireHold(index);}
@@ -872,7 +884,7 @@ void LooperProcessor::getStateInformation (MemoryBlock& data)
     const auto saved = takeSnapshot();
     MemoryOutputStream out (data, false);
     out.writeInt (0x454c4c50);
-    out.writeInt (17);
+    out.writeInt (18);
     out.writeDouble (saved.rate > 0 ? saved.rate : 44100);
     out.writeFloat (volume->get());
     out.writeInt (saved.length);
@@ -930,7 +942,7 @@ void LooperProcessor::setStateInformation (const void* data, int size)
     if (in.readInt() != 0x454c4c50)
         return;
     const int version = in.readInt();
-    if (version < 1 || version > 17)
+    if (version < 1 || version > 18)
         return;
     LooperEngine::Snapshot snapshot;
     snapshot.rate = in.readDouble();
@@ -1087,7 +1099,7 @@ void LooperProcessor::setStateInformation (const void* data, int size)
         if(in.getNumBytesRemaining()<32)return;
         for(auto& v:performance){v=in.readInt();if(v<0||v>1)return;}
         savedCountIn=in.readInt();savedThreshold=in.readFloat();
-        if(savedCountIn<1||savedCountIn>8||!std::isfinite(savedThreshold)||savedThreshold< -80||savedThreshold>0)return;
+        if(savedCountIn<(version>=18?0:1)||savedCountIn>8||!std::isfinite(savedThreshold)||savedThreshold< -80||savedThreshold>0)return;
     }
     int previewVisible=1;
     if(version>=14){previewVisible=in.readInt();if(previewVisible<0||previewVisible>1)return;}
@@ -1096,7 +1108,7 @@ void LooperProcessor::setStateInformation (const void* data, int size)
     controls[0].shortAction=1;controls[0].holdAction=3;controls[0].finishFixed=true;
     if(version>=15) {
         for(auto& c:controls){const auto packed=uint32_t(in.readInt());c=unpackControl(packed);
-            if(packed>(version>=17?0x3ffffffu:version>=16?0xffffffu:16383u) || c.shortAction>1 || c.start>2 || c.bars<1 || c.bars>8 || c.loops>64)return;}
+            if(packed>(version>=18?0x7ffffffu:version>=17?0x3ffffffu:version>=16?0xffffffu:16383u) || c.shortAction>1 || c.start>2 || c.bars<0 || c.bars>8 || c.loops>64)return;}
         if(!controls[0].enabled || !controls[1].enabled)return;
         for(int i=6;i<8;++i){mappingValues[i]=in.readInt();const int n=mappingValues[i];
             if(n< -1 || (n>=0 && ((n&255)>127 || (n>>8)>16)))return;
@@ -1511,26 +1523,26 @@ class RecordingSettings final : public Component, private Timer
         LooperProcessor& owner;int index;
         GroupComponent group;
         std::array<Label,11> labels;
-        Label loopUnits;
-        ComboBox shortAction,holdAction,start,boundary;
+        Label loopUnits,barUnits;
+        ComboBox shortAction,holdAction,start,boundary,finish;
         Slider bars,loops;
-        ToggleButton finish,hear,metronome,withinTake,stopAfter;
+        ToggleButton roundEnd,hear,metronome,withinTake,stopAfter;
         TextButton toggle;
         Card(LooperProcessor& p,int i):owner(p),index(i) {
             group.setText(i==0?"Record":i==1?"Overdub":"Custom "+String(i-1)+" (no live button)");
             addAndMakeVisible(group);group.setInterceptsMouseClicks(false,false);
-            const char* names[]{"Short press:","Hold:","Start:","Count-in bars:","Count-in metronome:","Fixed length:","At loop boundary:","Previous pass:","Record for:","Feedback within One Take:","Stop after recording:"};
+            const char* names[]{"Short press:","Hold:","Start:","Count-in:","Count-in metronome:","Recording length:","At loop boundary:","Previous pass:","Loop lengths:","Feedback within One Take:","Stop after recording:"};
             for(int n=0;n<11;++n){labels[n].setText(names[n],dontSendNotification);addAndMakeVisible(labels[n]);}
             shortAction.addItem("Add layers",1);shortAction.addItem("Mute old layers + record",2);
             holdAction.addItem("No action",1);holdAction.addItem("Record",2);holdAction.addItem("Replace while held",3);holdAction.addItem("Clear + fresh recording",4);holdAction.addItem("Record while held",5);
-            start.addItem("Now",1);start.addItem("Next bar",2);start.addItem("Count-in / Wait for sound",3);
+            start.addItem("Now",1);start.addItem("Count-in / Wait for sound",3);
             boundary.addItem("New layer",1);boundary.addItem("Overwrite current layer",2);
-            finish.setButtonText("Finish recording");hear.setButtonText("Play while overwriting");
+            finish.addItem("Until stopped",1);finish.addItem("To loop end",2);finish.addItem("Loop lengths",3);roundEnd.setButtonText("Finish at loop boundary");addAndMakeVisible(roundEnd);roundEnd.setTooltip("After the selected number of full loop lengths, continue to the next end of this looper cycle. If already at the boundary, stop there.");hear.setButtonText("Play while overwriting");
             for(auto* c:std::initializer_list<Component*>{&shortAction,&holdAction,&start,&boundary,&bars,&loops,&finish,&hear,&metronome,&withinTake,&stopAfter,&toggle})addAndMakeVisible(c);
-            bars.setRange(1,8,1);loops.setRange(0,64,1);
+            bars.setRange(1,9,1);loops.setRange(1,64,1);barUnits.setText("1 = Next bar",dontSendNotification);barUnits.setFont(FontOptions(12));addAndMakeVisible(barUnits);
             for(auto* slider:{&bars,&loops}){slider->getProperties().set("numberOnly",true);slider->setTextBoxStyle(Slider::TextBoxLeft,false,64,24);slider->setScrollWheelEnabled(false);}
-            loopUnits.setText("loops   (0 = Unlimited)",dontSendNotification);loopUnits.setFont(FontOptions(12));addAndMakeVisible(loopUnits);
-            loops.setTooltip("Records for this many loop lengths from capture start, not this many layers. Zero means unlimited; One Take and memory limits still apply. A loop length must first be established.");
+            loopUnits.setText("loops",dontSendNotification);loopUnits.setFont(FontOptions(12));addAndMakeVisible(loopUnits);
+            loops.setTooltip("Record N full loop durations from capture start, not N layers. Finish at loop boundary optionally extends to the next cycle end. Memory limits still apply. Replace while held ends on release.");
             labels[8].setTooltip(loops.getTooltip());
             metronome.setTooltip("Requests the count-in metronome for this controller only. Connect Looper MIDI Out to Count-in Gate; TICK follows the separate headphones audio route.");
             labels[4].setTooltip(metronome.getTooltip());
@@ -1544,19 +1556,19 @@ class RecordingSettings final : public Component, private Timer
             hear.setTooltip("Monitor the previous pass while replacing it. This never mixes it into the new recording. Other layers keep playing normally.");
             start.setTooltip("Count-in is used in Sync/Fixed bars. Free mode waits for the shared sound threshold. The first Fixed bars capture always starts on a bar boundary.");
             finish.setTooltip("At the fixed loop length, finish recording. When off, continue capturing according to At loop boundary.");
-            bars.setTooltip("Full count-in bars after the next bar boundary. Applies to this profile in Sync/Fixed bars when Count-in is selected. It does not change other profiles or the rig tempo.");
-            start.setTooltip("Choose when this profile starts recording. Now starts immediately in Free; in Sync a first capture can recover the current bar from input history. Next bar waits for a bar boundary. Count-in waits the chosen full bars; in Free this option becomes Wait for sound using General's threshold. A first Fixed bars capture aligns to a bar even with Now.");
-            finish.setTooltip("Finish capture when the Fixed bars length is reached. When off, capture continues using At loop boundary. Stop after recording separately decides whether completed audio plays or the looper stops.");
+            bars.setTooltip("Count upcoming bar boundaries: 1 = Next bar, 2 = one full bar later. Only Sync/Fixed. The display includes the unfinished current bar; timing is unchanged for saved sessions.");
+            start.setTooltip("Now starts without preparation; the first Fixed capture still aligns to a bar. Count-in counts upcoming boundaries (1 = Next bar). In Free, Wait for sound uses the shared threshold. Held Add/Replace bypass preparation; short presses use it.");
+            finish.setTooltip("Until stopped: finish manually. To loop end: finish at the next end of this looper cycle. Loop lengths: record N full durations from capture start, optionally rounded to the cycle boundary. Unknown initial length must first be established manually. Stop after recording separately controls playback.");
             toggle.setTooltip("Enable or remove this Custom recording profile. Enabling starts with Overdub-like defaults. Removing the profile does not delete recorded audio. Assign MIDI in the MIDI tab, or select the profile in a Manager.");
             Component* fields[]{&shortAction,&holdAction,&start,&bars,&metronome,&finish,&boundary,&hear,&loops,&withinTake,&stopAfter};
             for(int n=0;n<11;++n)if(auto* client=dynamic_cast<TooltipClient*>(fields[n]))labels[n].setTooltip(client->getTooltip());
-            const char* brief[]{"Action for a short press of this recording controller.","Action after holding this MIDI controller for 0.8 seconds.","When this controller begins recording.","Complete bars to wait before recording.","Request a click on the separate count-in audio route.","Finish capture at the configured Fixed bars length.","Add another layer or overwrite at each loop wrap.","Hear the previous pass while overwriting it.","Stop capture after this many loop lengths; 0 is unlimited.","Apply feedback to earlier parts of this same One Take.","Stop this looper after the recording finishes."};
+            const char* brief[]{"Action for a short press of this recording controller.","Action after holding this MIDI controller for 0.8 seconds.","When this controller begins recording.","Count upcoming boundaries: 1 = Next bar.","Request a click on the separate count-in audio route.","Choose manual completion, the next loop end, or N loop lengths.","Add another layer or overwrite at each loop wrap.","Hear the previous pass while overwriting it.","Record this many full loop lengths from capture start.","Apply feedback to earlier parts of this same One Take.","Stop this looper after the recording finishes."};
             for(int n=0;n<11;++n){fields[n]->getProperties().set("jgodHelpBrief",brief[n]);labels[n].getProperties().set("jgodHelpBrief",brief[n]);}
             auto changed=[this]{auto c=owner.recordingControl(index);c.shortAction=shortAction.getSelectedId()-1;c.holdAction=holdAction.getSelectedId()-1;
-                if(owner.getQuantized() || c.start!=1 || start.getSelectedId()!=1)c.start=start.getSelectedId()-1;
-                c.bars=int(bars.getValue());c.loops=int(loops.getValue());c.metronome=metronome.getToggleState();c.feedbackWithinTake=withinTake.getToggleState();c.stopAfter=stopAfter.getToggleState();c.finishFixed=finish.getToggleState();c.overwrite=boundary.getSelectedId()==2;c.hearPrevious=hear.getToggleState();owner.setRecordingControl(index,c);};
-            for(auto* box:{&shortAction,&holdAction,&start,&boundary})box->onChange=changed;
-            bars.onValueChange=changed;loops.onValueChange=changed;finish.onClick=changed;hear.onClick=changed;metronome.onClick=changed;withinTake.onClick=changed;stopAfter.onClick=changed;
+                if(owner.getQuantized() || c.start!=1 || start.getSelectedId()!=1)c.start=start.getSelectedId()==3?2:0;
+                if(owner.getQuantized())c.bars=int(bars.getValue())-1;c.loops=finish.getSelectedId()==3?int(loops.getValue()):0;c.finishAtBoundary=roundEnd.getToggleState();c.metronome=metronome.getToggleState();c.feedbackWithinTake=withinTake.getToggleState();c.stopAfter=stopAfter.getToggleState();c.finishFixed=finish.getSelectedId()==2;c.overwrite=boundary.getSelectedId()==2;c.hearPrevious=hear.getToggleState();owner.setRecordingControl(index,c);};
+            for(auto* box:{&shortAction,&holdAction,&start,&boundary,&finish})box->onChange=changed;
+            bars.onValueChange=changed;loops.onValueChange=changed;roundEnd.onClick=changed;hear.onClick=changed;metronome.onClick=changed;withinTake.onClick=changed;stopAfter.onClick=changed;
             toggle.onClick=[this]{auto c=owner.recordingControl(index);if(c.enabled)c.enabled=false;else {c={};c.enabled=true;}owner.setRecordingControl(index,c);};
         }
         void refresh(bool locked){
@@ -1571,21 +1583,25 @@ class RecordingSettings final : public Component, private Timer
             shortAction.setTooltip(c.shortAction==0?"Adds layers while older layers keep playing. Uses this controller's timing and limits; another short press finishes recording.":"Records a new layer with the existing loop length and disables older layers without deleting them. Uses this controller's timing and limits; another short press finishes recording.");labels[0].setTooltip(shortAction.getTooltip());
             shortAction.setSelectedId(c.shortAction+1,dontSendNotification);holdAction.setSelectedId(c.holdAction+1,dontSendNotification);
             start.changeItemText(3,owner.getQuantized()?"Count-in":"Wait for sound");
-            start.setSelectedId(!owner.getQuantized() && c.start==1?1:c.start+1,dontSendNotification);boundary.setSelectedId(c.overwrite?2:1,dontSendNotification);
-            for(auto pair:{std::pair<Slider*,double>{&bars,c.bars},{&loops,c.loops}})if(!pair.first->isMouseButtonDown())pair.first->setValue(pair.second,dontSendNotification);
+            start.setSelectedId(c.start==1?(owner.getQuantized()?3:1):c.start+1,dontSendNotification);boundary.setSelectedId(c.overwrite?2:1,dontSendNotification);
+            for(auto pair:{std::pair<Slider*,double>{&bars,c.start==1?1:c.bars+1},{&loops,std::max(1,c.loops)}})if(!pair.first->isMouseButtonDown())pair.first->setValue(pair.second,dontSendNotification);
             stopAfter.setToggleState(c.stopAfter,dontSendNotification);
-            finish.setToggleState(c.finishFixed,dontSendNotification);hear.setToggleState(c.hearPrevious,dontSendNotification);
+            finish.setSelectedId(c.finishFixed?2:c.loops>0?3:1,dontSendNotification);roundEnd.setToggleState(c.finishAtBoundary,dontSendNotification);hear.setToggleState(c.hearPrevious,dontSendNotification);
             metronome.setToggleState(c.metronome,dontSendNotification);withinTake.setToggleState(c.feedbackWithinTake,dontSendNotification);
             for(auto* comp:std::initializer_list<Component*>{&shortAction,&holdAction,&start,&boundary,&bars,&loops,&finish,&hear,&metronome,&withinTake,&stopAfter})comp->setEnabled(c.enabled&&!locked);
-            hear.setEnabled(c.enabled&&!locked&&c.overwrite);bars.setEnabled(c.enabled&&!locked&&owner.getQuantized());metronome.setEnabled(c.enabled&&!locked&&owner.getQuantized());
-            start.setItemEnabled(2,owner.getQuantized());toggle.setVisible(index>=2);toggle.setEnabled(!locked);toggle.setButtonText(c.enabled?"Remove":"Enable profile");
+            hear.setEnabled(c.enabled&&!locked&&c.overwrite);bars.setEnabled(c.enabled&&!locked&&owner.getQuantized()&&c.start!=0);metronome.setEnabled(c.enabled&&!locked&&owner.getQuantized()&&c.start!=0);
+            const auto context=owner.view();
+            finish.setEnabled(c.enabled&&!locked);loops.setEnabled(c.enabled&&!locked&&!c.finishFixed&&c.loops>0);roundEnd.setEnabled(loops.isEnabled());
+            toggle.setVisible(index>=2);toggle.setEnabled(!locked);toggle.setButtonText(c.enabled?"Remove":"Enable profile");
+            Component* fields[]{&shortAction,&holdAction,&start,&bars,&metronome,&finish,&boundary,&hear,&loops,&withinTake,&stopAfter};
+            for(int n=0;n<11;++n)labels[n].setEnabled(fields[n]->isEnabled());
         }
         void resized() override {
             group.setBounds(getLocalBounds());auto a=getLocalBounds().reduced(10);a.removeFromTop(16);
             if(index>=2){toggle.setBounds(a.removeFromTop(26));a.removeFromTop(4);}
             Component* fields[]{&shortAction,&holdAction,&start,&bars,&metronome,&finish,&boundary,&hear,&loops,&withinTake,&stopAfter};
             for(int n=0;n<11;++n){auto row=a.removeFromTop(28);labels[n].setBounds(row.removeFromLeft(n==4||n==9?225:125));
-                if(n==3 || n==8){fields[n]->setBounds(row.removeFromLeft(64).reduced(1));if(n==8)loopUnits.setBounds(row);}
+                if(n==3 || n==8){fields[n]->setBounds(row.removeFromLeft(64).reduced(1));if(n==8){loopUnits.setBounds(row.removeFromLeft(36));roundEnd.setBounds(row);}else barUnits.setBounds(row);}
                 else if(n==4 || n==9)fields[n]->setBounds(row.removeFromLeft(26).reduced(1));
                 else fields[n]->setBounds(row.reduced(1));}
 
@@ -1841,8 +1857,8 @@ public:
         display.setComponentID("looper-status-display");display.setJustificationType(Justification::centred);display.setFont(FontOptions(19.0f));
         display.setColour(Label::backgroundColourId,Colour(0xff111820));
         display.setColour(Label::outlineColourId,Colour(0xff465564));
-        recordReady.onClick=[this]{owner.recordPreparation=recordReady.getToggleState();};
-        overdubReady.onClick=[this]{owner.overdubPreparation=overdubReady.getToggleState();};
+        recordReady.onClick=[this]{auto c=owner.recordingControl(0);if(c.start==1)c.bars=0;c.start=recordReady.getToggleState()?2:0;owner.setRecordingControl(0,c);};
+        overdubReady.onClick=[this]{auto c=owner.recordingControl(1);if(c.start==1)c.bars=0;c.start=overdubReady.getToggleState()?2:0;owner.setRecordingControl(1,c);};
         playPosition.addItem("Keep alignment",1);playPosition.addItem("From beginning",2);
         playTiming.addItem("Immediately",1);playTiming.addItem("Next bar",2);
         stopTiming.addItem("Immediately",1);stopTiming.addItem("Next bar",2);
@@ -2382,7 +2398,7 @@ private:
         const auto data = owner.view();
         visibleRows=data.count;
         if(!layersOnly) {
-        const bool capacityEditable=(data.state==int(LooperEngine::State::empty)||data.state==int(LooperEngine::State::stopped))&&!data.armed&&!data.finishingEdit;
+        const bool capacityEditable=!owner.recordingSettingsLocked() && (data.state==int(LooperEngine::State::empty)||data.state==int(LooperEngine::State::stopped))&&!data.armed&&!data.finishingEdit;
         durationSlider.setEnabled(capacityEditable);
         if(!historySecondsSlider.isMouseButtonDown())historySecondsSlider.setValue(owner.getHistorySeconds(),dontSendNotification);
         if(!historyMinSlider.isMouseButtonDown())historyMinSlider.setValue(owner.getHistoryMinimum(),dontSendNotification);
@@ -2407,8 +2423,8 @@ private:
         syncLine.setColour(ProgressBar::foregroundColourId,Colours::skyblue);
         const String prepareLabel=owner.getQuantized()?"Count-in":"Wait for sound";
         recordReady.setButtonText(prepareLabel);overdubReady.setButtonText(prepareLabel);
-        recordReady.setToggleState(owner.recordPreparation.load(),dontSendNotification);
-        overdubReady.setToggleState(owner.overdubPreparation.load(),dontSendNotification);
+        recordReady.setToggleState((owner.recordingControl(0).start==2 || (owner.getQuantized()&&owner.recordingControl(0).start==1)),dontSendNotification);
+        overdubReady.setToggleState((owner.recordingControl(1).start==2 || (owner.getQuantized()&&owner.recordingControl(1).start==1)),dontSendNotification);
         playPosition.setSelectedId(owner.preserveTimeline.load()?1:2,dontSendNotification);
         playTiming.setSelectedId(owner.playOnBar.load()?2:1,dontSendNotification);stopTiming.setSelectedId(owner.stopOnBar.load()?2:1,dontSendNotification);
         for(auto* c:{&playPosition,&playTiming,&stopTiming})c->setEnabled(owner.getQuantized());
@@ -2425,14 +2441,14 @@ private:
         monitorButton.setToggleState (owner.getMonitor(), dontSendNotification);
         muteButton.setToggleState (owner.getMuted(), dontSendNotification);
         endMode.setSelectedId (owner.getLoopMode()+1, dontSendNotification);
-        fixedBarsSlider.setEnabled(owner.getLoopMode()==2 && !data.armed && data.state!=1 && data.state!=4 && data.state!=5);
+        fixedBarsSlider.setEnabled(owner.getLoopMode()==2 && !owner.recordingSettingsLocked() && !data.armed);
         if(!fixedBarsSlider.isMouseButtonDown())fixedBarsSlider.setValue(owner.getFixedBarCount(),dontSendNotification);
         const bool capturing=data.state==1||data.state==4||data.state==5;
         const bool controllerLocked=owner.recordingSettingsLocked();
         recordReady.setEnabled(!controllerLocked);overdubReady.setEnabled(!controllerLocked);
         resetDefaults.setEnabled(capacityEditable && !controllerLocked);
         for(int i=0;i<LooperProcessor::midiActions;++i){const bool enabled=!controllerLocked && (i<6 || i==8 || owner.recordingControl(i-4).enabled);midiCC[i].setEnabled(enabled);midiChannel[i].setEnabled(enabled);}
-        endMode.setEnabled(!capturing && !data.armed);
+        endMode.setEnabled(!controllerLocked && !data.armed);
         const int displayLength=data.captureTarget>0?data.captureTarget:data.length;
         progressBar.bars=owner.getQuantized() && data.barFrames>0 ? double(displayLength)/data.barFrames : 0;
         if(owner.getLoopMode()==2 && data.length==0)progressBar.bars=owner.getFixedBarCount();
@@ -2451,7 +2467,7 @@ private:
         if(!captureTailSlider.isMouseButtonDown()) captureTailSlider.setValue(owner.getCaptureTail(),dontSendNotification);
         if(!stopFadeSlider.isMouseButtonDown()) stopFadeSlider.setValue(owner.getStopFade(),dontSendNotification);
         if(!undoDepthSlider.isMouseButtonDown()) undoDepthSlider.setValue(owner.getUndoDepth(),dontSendNotification);
-        undoDepthSlider.setEnabled((data.state==int(LooperEngine::State::empty) || data.state==int(LooperEngine::State::stopped)) && !data.armed && !data.finishingEdit);
+        undoDepthSlider.setEnabled(capacityEditable);
         buttons[0].setButtonText ((capturing && data.controller==0) ? "End Record [S]" : "Record [S]");
         buttons[2].setButtonText (capturing && data.controller==1 ? "End Overdub [A]" : "Overdub [A]");
         for (int index : { 0, 2 })

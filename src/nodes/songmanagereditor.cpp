@@ -14,7 +14,7 @@ SongManagerEditor::SongManagerEditor(const Node& n):NodeEditor(n),manager(dynami
     helpPanel.setText("Help\nPoint to a setting or its label to read more. The explanation stays here when you move the pointer away.");
     helpToggle.setTooltip("Show or hide detailed help.");
     helpToggle.onClick=[this]{helpOpen=!helpOpen;updateHelpMode();resized();};
-    for(Component* c:std::initializer_list<Component*>{&generalTab,&midiTab,&title,&settings,&status,&help,&sections,&list,&add,&remove,&up,&down,&next,&panic,&restore,&rewind,&switchLabel,&barsLabel,&recordLabel,&channelLabel,&timing,&recording,&bars,&channel})addAndMakeVisible(c);
+    for(Component* c:std::initializer_list<Component*>{&generalTab,&midiTab,&title,&settings,&status,&help,&sections,&list,&add,&remove,&up,&down,&next,&panic,&restore,&rewind,&switchLabel,&barsLabel,&countHint,&recordLabel,&channelLabel,&timing,&recording,&bars,&channel})addAndMakeVisible(c);
     title.setText("Song Manager",dontSendNotification);title.setFont(FontOptions(15.0f,Font::bold));
     status.setComponentID("song-status");status.setFont(FontOptions(16.0f,Font::bold));status.setJustificationType(Justification::centredLeft);
     status.setColour(Label::backgroundColourId,Colour(0xff111820));status.setColour(Label::outlineColourId,Colour(0xff465564));
@@ -38,18 +38,18 @@ SongManagerEditor::SongManagerEditor(const Node& n):NodeEditor(n),manager(dynami
     midiTab.setTooltip("Assign MIDI controls for this Song Manager.");
     sections.setTooltip("Choose an existing section to add to the song order.");
     add.setTooltip("Append the selected section. Add it again to repeat it later in the song.");
-    managerLabel(switchLabel,"Switch");managerLabel(barsLabel,"Count-in bars");managerLabel(recordLabel,"Recording action");managerLabel(channelLabel,"MIDI channel");
-    timing.addItem("Now",1);timing.addItem("Next bar",2);timing.addItem("Count-in",3);
+    managerLabel(switchLabel,"Switch");managerLabel(barsLabel,"Count-in");managerLabel(countHint,"1 = Next bar");managerLabel(recordLabel,"Recording action");managerLabel(channelLabel,"MIDI channel");
+    timing.addItem("Now",1);timing.addItem("Count-in",3);
     recording.addItem("None",1);recording.addItem("Record",2);recording.addItem("Overdub",3);recording.addItem("Custom 1",4);recording.addItem("Custom 2",5);
     recording.setTooltip("After Next, invoke this profile on the first looper in the destination's single QLooper Manager, in its Looper order. The looper owns recording timing. Double-clicking a section skips this action.");
-    timing.setTooltip("Now switches immediately. Next bar waits for the next rig bar. Count-in adds the selected number of complete bars. Stopped transport switches immediately.");
-    managerNumber(bars,"Number of complete count-in bars after the next bar boundary.");bars.setRange(1,32,1);
+    timing.setTooltip("Now switches immediately. Count-in counts upcoming boundaries: 1 = Next bar, 2 = one complete bar later. Stopped transport switches immediately.");
+    managerNumber(bars,"Upcoming boundaries before switching: 1 = Next bar.");bars.setRange(1,33,1);
     managerNumber(channel,"Shared MIDI channel for all Song Manager controls.");channel.setRange(1,16,1);
     switchLabel.setTooltip(timing.getTooltip());recordLabel.setTooltip(recording.getTooltip());
     barsLabel.setTooltip(bars.getTooltip());channelLabel.setTooltip(channel.getTooltip());
-    timing.onChange=[this]{if(manager)manager->switchTiming=timing.getSelectedId()-1;};
+    timing.onChange=[this]{if(manager)manager->switchTiming=timing.getSelectedId()==1?0:bars.getValue()==1?1:2;};
     recording.onChange=[this]{if(manager)manager->recordingProfile=recording.getSelectedId()-2;};
-    bars.onValueChange=[this]{if(manager)manager->countInBars=int(bars.getValue());};channel.onValueChange=[this]{if(manager)manager->channel=int(channel.getValue());};
+    bars.onValueChange=[this]{if(manager){manager->countInBars=std::max(1,int(bars.getValue())-1);if(manager->switchTiming.load()!=0)manager->switchTiming=bars.getValue()==1?1:2;}};channel.onValueChange=[this]{if(manager)manager->channel=int(channel.getValue());};
     const StringArray names{"Next / Hold Panic","Next section","Back to start","Panic","Restore audio"};
     for(int i=0;i<5;++i) {
         addAndMakeVisible(midiLabels[i]);addAndMakeVisible(midiCC[i]);addAndMakeVisible(midiAssign[i]);managerLabel(midiLabels[i],names[i]);
@@ -61,8 +61,8 @@ SongManagerEditor::SongManagerEditor(const Node& n):NodeEditor(n),manager(dynami
     }
     help.setText("MIDI uses the parent graph input; no MIDI cable to this box. Use distinct CC mappings. Set a CC to -1 to disable it.",dontSendNotification);help.setJustificationType(Justification::topLeft);
     auto pairHelp=[this](Component& label,Component& control,const String& brief,const String& detail){addHelp(label,brief,detail);addHelp(control,brief,detail);};
-    pairHelp(switchLabel,timing,"When Next switches to the following section.","Switch\nNow switches immediately. Next bar waits for the next rig bar boundary. Count-in waits for that boundary and then the chosen number of complete bars. If the rig transport is stopped, switching is immediate. Press Next again while waiting to cancel.");
-    pairHelp(barsLabel,bars,"Extra full bars to wait in Count-in mode.","Count-in bars\nApplies only when Switch is Count-in. For example, 2 waits for the next bar boundary, counts two complete bars, then switches section. This controls the section transition; a target looper may have its own additional recording count-in.");
+    pairHelp(switchLabel,timing,"When Next switches to the following section.","Switch\nNow switches immediately. Count-in counts upcoming bar boundaries: 1 = Next bar, 2 = one full bar later. If the rig transport is stopped, switching is immediate. Press Next again while waiting to cancel.");
+    pairHelp(barsLabel,bars,"Upcoming bar boundaries; 1 = Next bar.","Count-in\nApplies only when Switch is Count-in. For example, 2 waits for the next bar boundary and one complete bar, then switches section. This controls the section transition; a target looper may have its own additional recording count-in.");
     pairHelp(recordLabel,recording,"Optional recording profile to invoke after Next.","Recording action\nNone only changes section. Otherwise the chosen Record, Overdub, Custom 1 or Custom 2 profile is invoked on the first looper in the target section's QLooper Manager order. That profile decides how and when recording starts. A missing or ambiguous manager or unavailable profile skips recording and shows a notice. Double-clicking a section never invokes this action.");
     pairHelp(channelLabel,channel,"MIDI channel used by all Song Manager mappings.","MIDI channel\nOnly CC messages on this channel control Song Manager. Assign learns both the CC number and its channel; learning a different channel therefore changes the channel for all mappings here. MIDI comes from the parent graph input, without a cable to this node.");
     const StringArray actions{
@@ -128,8 +128,8 @@ void SongManagerEditor::timerCallback(){
     const bool editable=!manager->selectionLocked()&&!manager->pending.load();for(Component* c:std::initializer_list<Component*>{&sections,&add,&remove,&up,&down})c->setEnabled(editable);
     next.setEnabled(!manager->muted.load()&&!manager->ended.load()&&!manager->orderIDs().empty()&&!manager->selectionLocked());next.setButtonText(manager->pending.load()?"Cancel next":"Next section");
     rewind.setEnabled(!manager->selectionLocked());restore.setEnabled(manager->muted.load());
-    timing.setSelectedId(manager->switchTiming.load()+1,dontSendNotification);recording.setSelectedId(manager->recordingProfile.load()+2,dontSendNotification);
-    bars.setValue(manager->countInBars.load(),dontSendNotification);bars.setEnabled(manager->switchTiming.load()==2);channel.setValue(manager->channel.load(),dontSendNotification);
+    timing.setSelectedId(manager->switchTiming.load()==0?1:3,dontSendNotification);recording.setSelectedId(manager->recordingProfile.load()+2,dontSendNotification);
+    bars.setValue(manager->switchTiming.load()==1?1:manager->countInBars.load()+1,dontSendNotification);bars.setEnabled(manager->switchTiming.load()!=0);channel.setValue(manager->channel.load(),dontSendNotification);
     for(int i=0;i<5;++i){midiCC[i].setValue(i==0?manager->pedalCC.load():manager->actionCC[i-1].load(),dontSendNotification);midiAssign[i].setButtonText(manager->learn.load()==i+1?"Cancel":"Assign");}
     list.updateContent();list.repaint();
 }
@@ -158,7 +158,7 @@ void SongManagerEditor::resized(){
     row=r.removeFromTop(28);show(generalTab,row.removeFromLeft(85));row.removeFromLeft(6);show(midiTab,row.removeFromLeft(70));
     generalTab.setToggleState(settingsTab==0,dontSendNotification);midiTab.setToggleState(settingsTab==1,dontSendNotification);r.removeFromTop(12);
     if(settingsTab==0){
-    row=r.removeFromTop(32);show(switchLabel,row.removeFromLeft(120));show(timing,row.removeFromLeft(140).reduced(2));row=r.removeFromTop(32);show(barsLabel,row.removeFromLeft(120));show(bars,row.removeFromLeft(70).reduced(2));
+    row=r.removeFromTop(32);show(switchLabel,row.removeFromLeft(120));show(timing,row.removeFromLeft(140).reduced(2));row=r.removeFromTop(32);show(barsLabel,row.removeFromLeft(120));show(bars,row.removeFromLeft(70).reduced(2));show(countHint,row);
     row=r.removeFromTop(32);show(recordLabel,row.removeFromLeft(120));show(recording,row.removeFromLeft(180).reduced(2));
     return;}
     row=r.removeFromTop(32);show(channelLabel,row.removeFromLeft(120));show(channel,row.removeFromLeft(70).reduced(2));r.removeFromTop(8);
