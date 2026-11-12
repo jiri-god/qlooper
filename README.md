@@ -4,9 +4,9 @@
 
 QLooper — a live layered looper, QLooper Manager, Song Manager and combined
 QLooper View, built into a modified [Kushview Element](https://github.com/kushview/element).
-An independent release by **princ.biz**, not an official Kushview product.
+An independent release by **Quantlu**, not an official Kushview product.
 
-- Website: https://qlooper.princ.biz
+- Website: https://qlooper.quantlu.com
 - [Quick start](docs/quick-start.md) — installation, your first loop, managers and MIDI.
 - [Nektar Pacer A1 preset](extras/nektar-pacer/README.txt) — looper controls with LED colours.
 - [Downloads](https://github.com/jiri-god/qlooper/releases) — choose RC2 for Apple Silicon.
